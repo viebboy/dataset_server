@@ -6,6 +6,9 @@ import time
 from loguru import logger
 
 class Dataset(CIFAR10):
+    """
+    Bootstrapping CIFAR10 dataset class from torchvision to be keyword argument based dataset
+    """
     def __init__(self, **kwargs):
         super().__init__(root='./data/', train=kwargs['train'], download=True)
 
