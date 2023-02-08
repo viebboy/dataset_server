@@ -50,3 +50,5 @@ async_dataloader = AsyncDataLoader(
 for samples in async_dataloader:
     # perform processing here with the samples
 ```
+
+For a complete example, please take a look at [cifar10 example](./examples/cifar10_example.py)
