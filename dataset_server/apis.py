@@ -367,7 +367,6 @@ class AsyncDataLoader:
     def __iter__(self):
         return self
 
-    @logger.catch
     def __next__(self):
         if self.minibatch_count >= self.total_minibatch:
             self.minibatch_count = 0
