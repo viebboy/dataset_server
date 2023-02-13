@@ -96,10 +96,10 @@ def concatenate_list(inputs, device=None):
 
     def _concatenate_item(x):
         if isinstance(x, list) and isinstance(x[0], torch.Tensor):
-            if x[0].dim() != 1:
-                result = torch.cat([item.unsqueeze(0) for item in x], dim=0)
-            else:
+            if torch.numel(x[0]) == 1:
                 result = torch.cat(x)
+            else:
+                result = torch.cat([item.unsqueeze(0) for item in x], dim=0)
 
             if device is not None:
                 return result.to(device)
