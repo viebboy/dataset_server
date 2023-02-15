@@ -223,6 +223,8 @@ class AsyncDataLoader:
         pin_memory=False,
         packet_size=125000,
         wait_time=10,
+        client_wait_time=10,
+        nb_retry=10,
     ):
         try:
             dataset_tmp = dataset_class(**dataset_params)
@@ -245,7 +247,7 @@ class AsyncDataLoader:
         )
 
         # start clients
-        self.start_clients(packet_size)
+        self.start_clients(packet_size, client_wait_time, nb_retry)
 
         # counter to track minibatch
         self.minibatch_count = 0
@@ -271,7 +273,7 @@ class AsyncDataLoader:
     def __exit__(self, *args):
         self.close()
 
-    def start_clients(self, packet_size):
+    def start_clients(self, packet_size, wait_time, nb_retry):
         """
         start the socket clients
         """
@@ -281,7 +283,13 @@ class AsyncDataLoader:
         self.client_indices = []
 
         for index, port in enumerate(self.ports):
-            new_client = DatasetClient(index, port, packet_size)
+            new_client = DatasetClient(
+                index,
+                port,
+                packet_size,
+                wait_time=wait_time,
+                nb_retry=nb_retry,
+            )
             self.clients.append(new_client)
             self.sizes.append(len(new_client))
             self.total_minibatch += len(new_client)
