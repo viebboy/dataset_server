@@ -34,6 +34,54 @@ import inspect
 # size of the header
 INTERCOM_HEADER_LEN = 4
 
+try:
+    import __builtin__ as B
+except ImportError:
+    import builtins as B
+
+BUILTIN_TYPES = []
+for t in B.__dict__.values():
+    if isinstance(t, type) and t is not object and t is not type:
+        BUILTIN_TYPES.append(t)
+
+
+def is_builtin_type(obj):
+    output = False
+    for t in BUILTIN_TYPES:
+        if isinstance(obj, t):
+            output = True
+            break
+    return output
+
+
+def mainify(obj):
+    """
+    If obj is not defined in __main__ then redefine it in
+    main so that dill will serialize the definition along with the object
+    Taken from:
+    https://oegedijk.github.io/blog/pickle/dill/python/2020/11/10/serializing-dill-references.html
+
+    Modified so that mainify is only applied to custom Class
+    """
+
+    # if obj is a class and is not a builtin type
+    if inspect.isclass(obj) and not is_builtin_type(obj):
+        if obj.__module__ != "__main__":
+            import __main__
+            s = inspect.getsource(obj)
+            co = compile(s, '<string>', 'exec')
+            exec(co, __main__.__dict__)
+            logger.debug(f'mainifying class : {obj}')
+        else:
+            logger.debug(f'get a class : {obj} but scope is in main')
+    elif isinstance(obj, (tuple, list)):
+        for item in obj:
+            mainify(item)
+    elif isinstance(obj, dict):
+        for _, value in obj.items():
+            mainify(value)
+
+
 def get_random_file(length):
     assert 0 < length < 256
     alphabet = list(string.ascii_lowercase)
@@ -361,7 +409,6 @@ class AsyncDataLoader:
                 if os.path.exists(file):
                     os.remove(file)
 
-
     def start_servers(
         self,
         dataset_class,
@@ -380,9 +427,13 @@ class AsyncDataLoader:
         class_name = dataset_class.__name__
         dataset_module_file = inspect.getfile(dataset_class)
         logger.info(f'dataset_module file: {dataset_module_file}')
+        logger.info(f'dataset_module name: {class_name}')
 
         # dump dataset-related data to a random file
         dataset_params_file = get_random_file(length=32)
+        # mainify dataset params:
+        #mainify(dataset_params)
+
         with open(dataset_params_file, 'wb') as fid:
             dill.dump({'class_name': class_name, 'params': dataset_params}, fid, recurse=True)
 

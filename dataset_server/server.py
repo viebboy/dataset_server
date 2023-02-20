@@ -527,19 +527,41 @@ class DataloaderServer(TaskThread):
                 str(e)
             )
 
+    @verbose
     async def load_dataset__(self):
         # load parameters first
         try:
-            with open(self.dataset_params_file, 'rb') as fid:
-                settings = dill.load(fid)
-                class_name = settings['class_name']
-                params = settings['params']
 
             # then import the data set file
+            module_name = os.path.basename(self.dataset_module_file).replace('.py', '')
+            logger.debug(f'dataset module file: {self.dataset_module_file}, module name: {module_name}')
+
             import importlib.util
             spec = importlib.util.spec_from_file_location('custom_dataset', self.dataset_module_file)
             module = importlib.util.module_from_spec(spec)
+
+            # check if there is name clashing
+            if module_name not in sys.modules.keys():
+                sys.modules[module_name] = module
+            else:
+                msg = (
+                    f'name clashing: the dataset module file: {self.dataset_module_file} ',
+                    f'has module name = {module_name}, which clashes with one of sys.modules. ',
+                    f'the dataset server might fail to load dataset because dependent modules are not loaded',
+                )
+                logger.warning(''.join(msg))
+                logger.warning(f'sys.modules contain the following modules: {sys.modules.keys()}')
+
             spec.loader.exec_module(module)
+            logger.debug(f'complete executing module')
+
+            logger.debug(f'loading dataset parameter file: {self.dataset_params_file}')
+            with open(self.dataset_params_file, 'rb') as fid:
+                settings = dill.load(fid)
+                logger.debug('complete dill deserialization of dataset params')
+                class_name = settings['class_name']
+                params = settings['params']
+            logger.debug(f'complete loading parameters for dataset')
 
             # create dataset
             # the module must have a Dataset class
