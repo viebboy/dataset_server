@@ -24,6 +24,7 @@ import sys
 from queue import Queue
 import math
 import numpy as np
+import os
 from task_thread import (
     reCreate,
     reSchedule,
@@ -409,6 +410,7 @@ class DataloaderServer(TaskThread):
     """
     def __init__(
         self,
+        status_file,
         dataset_module_file,
         dataset_params_file,
         total_server,
@@ -423,6 +425,10 @@ class DataloaderServer(TaskThread):
         device=None,
         packet_size=125000,
     ):
+        if os.path.exists(status_file) and os.path.isfile(status_file):
+            os.remove(status_file)
+
+        self.status_file = status_file
         self.dataset_module_file = dataset_module_file
         self.dataset_params_file = dataset_params_file
         self.total_server = total_server
@@ -552,8 +558,12 @@ class DataloaderServer(TaskThread):
             nb_mini_batch = int(np.ceil(self.total_sample / self.batch_size))
             self.dataset_length.put(nb_mini_batch)
 
-            # start the task to prefetch samples
+            with open(self.status_file, 'w') as fid:
+                fid.write('ready')
+
             logger.info('server completes loading dataset')
+
+            # start the task to prefetch samples
             self.tasks.generate_sample = await reCreate(self.tasks.generate_sample, self.generate_sample__)
 
         except asyncio.CancelledError:

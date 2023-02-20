@@ -34,6 +34,14 @@ import inspect
 # size of the header
 INTERCOM_HEADER_LEN = 4
 
+def get_random_file(length):
+    assert 0 < length < 256
+    alphabet = list(string.ascii_lowercase)
+    random_name = [random.choice(alphabet) for _ in range(length)]
+    random_name = os.path.join(tempfile.gettempdir(), ''.join(random_name))
+    return random_name
+
+
 def reconstruct_data(clients, data_queue, max_queue_size, close_event, device, pin_memory):
     # get the sample from the 1st client in the client list
     nb_client = len(clients)
@@ -157,25 +165,36 @@ class DatasetClient:
             count = 0
 
             # try to connect
+            success = False
             while True:
                 try:
                     self.socket.connect((self.hostname, self.port))
                     logger.info(f'connected to server {self.hostname} at port {self.port}')
+                    success = True
                     break
                 except Exception as e:
                     time.sleep(self.wait_time)
                     count += 1
+                    msg = (
+                        f'failed to connect at the {count}-th attempt! ',
+                        f'wating {self.wait_time} seconds before retrying'
+                    )
+                    logger.warning(''.join(msg))
                     if count >= self.nb_retry:
                         logger.warning(f'failed to connect after retrying {self.nb_retry} times')
                         logger.warning('terminating now!!!')
+                        break
 
             # disable naggle algorithm
             #self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, True)
 
             # now read the size of the dataset (number of minibatches)
             # the size is sent as 4 bytes
-            self.size = int.from_bytes(self.socket.recv(4), 'big')
-            self.write_socket('ok')
+            if success:
+                self.size = int.from_bytes(self.socket.recv(4), 'big')
+                self.write_socket('ok')
+            else:
+                raise RuntimeError(f'failed to connect after retrying {self.nb_retry} times')
 
     def read_socket(self):
         """
@@ -235,24 +254,28 @@ class AsyncDataLoader:
 
         # start the servers
         logger.info('starting services, this will take a while')
-        self.start_servers(
-            dataset_class,
-            dataset_params,
-            batch_size,
-            nb_servers,
-            start_port,
-            max_queue_size,
-            shuffle,
-            packet_size,
+        self.status_files = self.start_servers(
+            dataset_class=dataset_class,
+            dataset_params=dataset_params,
+            batch_size=batch_size,
+            nb_servers=nb_servers,
+            start_port=start_port,
+            max_queue_size=max_queue_size,
+            shuffle=shuffle,
+            packet_size=packet_size,
         )
+        self.wait_for_servers()
+
+        self.is_closed = False
+        self.is_client_available = False
 
         # start clients
         self.start_clients(packet_size, client_wait_time, nb_retry)
+        self.is_client_available = True
 
         # counter to track minibatch
         self.minibatch_count = 0
 
-        self.is_closed = False
 
         # start the thread to reconstruct data and put them into a queue
         self.data_queue = Queue()
@@ -266,6 +289,19 @@ class AsyncDataLoader:
         # wait a bit to generate some samples before returning
         logger.info(f'waiting {wait_time} seconds to preload some samples')
         time.sleep(wait_time)
+
+    def wait_for_servers(self):
+        logger.info('waiting for servers to load dataset...')
+        while True:
+            ready = True
+            for file in self.status_files:
+                if not os.path.exists(file):
+                    ready = False
+                    break
+            if not ready:
+                time.sleep(1)
+            else:
+                break
 
     def __enter__(self):
         return self
@@ -283,13 +319,19 @@ class AsyncDataLoader:
         self.client_indices = []
 
         for index, port in enumerate(self.ports):
-            new_client = DatasetClient(
-                index,
-                port,
-                packet_size,
-                wait_time=wait_time,
-                nb_retry=nb_retry,
-            )
+            logger.info(f'starting DatasetClient number {index} at port: {port}')
+            try:
+                new_client = DatasetClient(
+                    index=index,
+                    port=port,
+                    packet_size=packet_size,
+                    wait_time=wait_time,
+                    nb_retry=nb_retry,
+                )
+            except Exception as error:
+                self.close()
+                raise error
+
             self.clients.append(new_client)
             self.sizes.append(len(new_client))
             self.total_minibatch += len(new_client)
@@ -300,15 +342,25 @@ class AsyncDataLoader:
     def close(self):
         if not self.is_closed:
             logger.info('closing the AsyncDataLoader instance')
-            self.close_event.set()
-            self.data_thread.join()
-            for client in self.clients:
-                client.close()
+            # close the thread running DatasetClient
+            if self.is_client_available:
+                self.close_event.set()
+                self.data_thread.join()
+                for client in self.clients:
+                    client.close()
 
+            # close the dataset servers
             for server in self.servers:
                 server.kill()
 
             self.is_closed = True
+            self.is_client_available = False
+
+            # delete status files
+            for file in self.status_files:
+                if os.path.exists(file):
+                    os.remove(file)
+
 
     def start_servers(
         self,
@@ -327,13 +379,15 @@ class AsyncDataLoader:
 
         class_name = dataset_class.__name__
         dataset_module_file = inspect.getfile(dataset_class)
+        logger.info(f'dataset_module file: {dataset_module_file}')
 
-        # dump the file
-        random_name = list(string.ascii_lowercase)
-        random.shuffle(random_name)
-        dataset_params_file = os.path.join(tempfile.gettempdir(), ''.join(random_name))
+        # dump dataset-related data to a random file
+        dataset_params_file = get_random_file(length=32)
         with open(dataset_params_file, 'wb') as fid:
             dill.dump({'class_name': class_name, 'params': dataset_params}, fid, recurse=True)
+
+        # create random files to write status after server is available
+        status_files = [get_random_file(32) for _ in range(nb_servers)]
 
         # start the server
         self.servers = []
@@ -361,12 +415,16 @@ class AsyncDataLoader:
                     str(shuffle),
                     '--packet-size',
                     str(packet_size),
+                    '--status-file',
+                    status_files[server_idx],
                 ]
             )
-            time.sleep(5)
+            time.sleep(2)
             self.servers.append(process)
             self.ports.append(start_port)
             start_port += 1
+
+        return status_files
 
 
     def __len__(self):

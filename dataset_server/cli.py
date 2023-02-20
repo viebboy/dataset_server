@@ -73,6 +73,12 @@ def parse_args():
         type=int,
         help="size of packet in bytes. Default to 125000"
     )
+    parser.add_argument(
+        "--status-file",
+        required=True,
+        type=str,
+        help="status file to write the status"
+    )
 
     args = parser.parse_args()
     if args.shuffle in ['True', 'true']:
@@ -96,6 +102,7 @@ def main():
         name=f'DataloaderServer-{args.server_index}',
         shuffle=args.shuffle,
         packet_size=args.packet_size,
+        status_file=args.status_file,
     )
 
     loop = asyncio.get_event_loop()
