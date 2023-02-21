@@ -121,5 +121,6 @@ def test_rotation():
 
 if __name__ == '__main__':
     #---------------------------------------
-    test_cache_client()
-    test_rotation()
+    test_cache_server()
+    #test_cache_client()
+    #test_rotation()

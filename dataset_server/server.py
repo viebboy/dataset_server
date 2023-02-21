@@ -35,9 +35,12 @@ from task_thread import (
 import copy
 from task_thread import TaskThread as BaseTaskThread
 from loguru import logger
+from dataset_server.common import BinaryBlob, shuffle_indices
+
 
 # size of the header
 INTERCOM_HEADER_LEN = 4
+
 
 def object_to_bytes(dic):
     """Turn dic into bytes & append the bytes with the bytes length
@@ -404,6 +407,7 @@ class ServerConnectionHandler(TaskThread):
         except Exception as e:
             await self.warn_and_exit('write_socket__', str(e))
 
+
 class DataloaderServer(TaskThread):
     """
     DataServer class
@@ -418,6 +422,7 @@ class DataloaderServer(TaskThread):
         batch_size,
         max_queue_size,
         shuffle,
+        nearby_shuffle,
         name="DataloaderServer",
         retry_interval=5,
         port=5002,
@@ -436,6 +441,7 @@ class DataloaderServer(TaskThread):
         self.batch_size = batch_size
         self.max_queue_size = max_queue_size
         self.shuffle = shuffle
+        self.nearby_shuffle = nearby_shuffle
         self.retry_interval = retry_interval
         self.port = port
         self.max_clients = max_clients
@@ -449,6 +455,7 @@ class DataloaderServer(TaskThread):
         self.server = None
         self.tasks.tcp_server = None
         self.tasks.generate_sample = None
+        self.tasks.read_sample = None
         self.tasks.generate_minibatch = None
         self.tasks.load_dataset = None
         self.sample_queue = Queue()
@@ -456,6 +463,12 @@ class DataloaderServer(TaskThread):
         self.minibatch_queue = Queue()
         self.current_minibatch = [[]]
         self.batcher_created = False
+        self.sample_reader_created = False
+        self.record = None
+        self.cache_update_frequency = 0
+        self.current_epoch = 0
+        self.cache_binary_file = None
+        self.cache_index_file = None
 
 
     @verbose
@@ -487,20 +500,61 @@ class DataloaderServer(TaskThread):
             else:
                 # check if the current queue size exceeds the max
                 if self.minibatch_queue.qsize() <= self.max_queue_size:
+                    # check whether sample is read from dataset or from cache
+                    if self.record is None:
+                        from_dataset = True
+                    else:
+                        if self.current_epoch == 0:
+                            # 1st epoch, if record in read mode
+                            # it means cache exists, just need to read from cache
+                            if self.record.mode() == 'read':
+                                from_dataset = False
+                            else:
+                                from_dataset = True
+                        else:
+                            if self.current_epoch % self.cache_update_frequency == 0:
+                                from_dataset = True
+                            else:
+                                from_dataset = False
+
                     # get a sample and put in the current list
-                    if self.cur_idx < self.total_sample:
+                    if from_dataset:
+                        if self.cur_idx == 0 and self.record is not None and self.record.mode() == 'read':
+                            self.record.close()
+                            self.record = BinaryBlob(self.cache_binary_file, self.cache_index_file, mode='w')
+
                         idx = self.indices[self.cur_idx]
                         sample = self.dataset[idx]
+                        if self.record is not None:
+                            self.record.write_index(idx, sample)
+
                         self.current_minibatch[0].append(sample)
                         self.cur_idx += 1
+                        if self.cur_idx == self.total_sample:
+                            self.cur_idx = 0
+                            self.current_epoch += 1
+                            if self.record is not None:
+                                self.record.close()
+                                self.record = BinaryBlob(
+                                    self.cache_binary_file,
+                                    self.cache_index_file,
+                                    mode='r',
+                                )
+                            if self.shuffle:
+                                start_idx = min(self.indices)
+                                stop_idx = max(self.indices) + 1
+                                self.indices = shuffle_indices(start_idx, stop_idx, self.nearby_shuffle)
                     else:
-                        self.cur_idx = 0
-                        if self.shuffle:
-                            random.shuffle(self.indices)
+                        idx = self.indices[self.cur_idx]
+                        sample = self.record.read_index(idx)
+                        self.current_minibatch[0].append(sample)
+                        self.cur_idx += 1
+                        if self.cur_idx == self.total_sample:
+                            self.cur_idx = 0
+                            self.current_epoch += 1
                 else:
                     await asyncio.sleep(0.001)
 
-            # reschedule the task
             self.tasks.generate_sample = await reSchedule(self.generate_sample__)
 
         except asyncio.CancelledError:
@@ -510,6 +564,12 @@ class DataloaderServer(TaskThread):
                 'generate_sample__',
                 str(e)
             )
+
+    async def warn_and_exit(self, function_name, warning):
+        if self.record is not None:
+            self.record.close()
+        await super().warn_and_exit(function_name, warning)
+
 
     @verbose
     async def generate_minibatch__(self):
@@ -561,6 +621,8 @@ class DataloaderServer(TaskThread):
                 logger.debug('complete dill deserialization of dataset params')
                 class_name = settings['class_name']
                 params = settings['params']
+                cache_setting = settings['cache_setting']
+
             logger.debug(f'complete loading parameters for dataset')
 
             # create dataset
@@ -569,12 +631,39 @@ class DataloaderServer(TaskThread):
             constructor = getattr(module, class_name)
             self.dataset = constructor(**params)
 
+            # handle caching
+            if cache_setting is not None and cache_setting['cache_side'] == 'server':
+                cache_binary_file = cache_setting['cache_prefix'] + '{:09d}.bin'.format(self.server_index)
+                cache_index_file = cache_setting['cache_prefix'] + '{:09d}.idx'.format(self.server_index)
+                # if files exist
+                if os.path.exists(cache_index_file) and os.path.exists(cache_binary_file):
+                    # if rewrite, we delete the files
+                    if cache_setting['rewrite']:
+                        os.remove(cache_index_file)
+                        os.remove(cache_binary_file)
+                        self.record = BinaryBlob(cache_binary_file, cache_index_file, mode='w')
+                    else:
+                        self.record = BinaryBlob(cache_binary_file, cache_index_file, mode='r')
+                else:
+                    self.record = BinaryBlob(cache_binary_file, cache_index_file, mode='w')
+                # if update frequency = K --> the cache files are rewritten
+                # every K epochs
+                self.cache_update_frequency = cache_setting['update_frequency']
+                if self.cache_update_frequency < 2:
+                    await self.warn_and_exit(
+                        'load_dataset__',
+                        f'cache update frequency must be at least 2, received: {self.cache_update_frequency}'
+                    )
+                self.cache_binary_file = cache_binary_file
+                self.cache_index_file = cache_index_file
+
+
             sample_per_server = math.ceil(len(self.dataset) / self.total_server)
             start_idx = self.server_index * sample_per_server
             stop_idx = min(len(self.dataset), (self.server_index + 1) * sample_per_server)
-            self.indices = list(range(start_idx, stop_idx))
-            if self.shuffle:
-                random.shuffle(self.indices)
+
+            self.indices = shuffle_indices(start_idx, stop_idx, self.nearby_shuffle)
+
             self.cur_idx = 0
             self.total_sample = stop_idx - start_idx
             nb_mini_batch = int(np.ceil(self.total_sample / self.batch_size))

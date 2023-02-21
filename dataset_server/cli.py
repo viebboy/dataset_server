@@ -68,6 +68,12 @@ def parse_args():
         help="whether to shuffle. Default to False"
     )
     parser.add_argument(
+        "--nearby-shuffle",
+        default=0,
+        type=int,
+        help="whether to shuffle in the nearby neighborhood to avoid too much file seek. If >0, it defines the nbh"
+    )
+    parser.add_argument(
         "--packet-size",
         default=125000,
         type=int,
@@ -103,6 +109,7 @@ def main():
         shuffle=args.shuffle,
         packet_size=args.packet_size,
         status_file=args.status_file,
+        nearby_shuffle=args.nearby_shuffle,
     )
 
     loop = asyncio.get_event_loop()
