@@ -26,10 +26,11 @@ if __name__ == '__main__':
         nb_servers=1,
         start_port=50000,
         max_queue_size=128,
+        qt_threading=True,
     )
 
     start = time.time()
-    for _ in range(10):
+    for _ in range(5):
         for samples in tqdm(dataloader):
             pass
     stop = time.time()

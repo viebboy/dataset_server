@@ -102,7 +102,7 @@ def reconstruct_data(clients, data_queue, max_queue_size, close_event, device, p
                 logger.info(f'receive signal to close reconstruction process')
                 return
 
-            if data_queue.qsize() < max_queue_size:
+            if data_queue.qsize() <= max_queue_size:
                 try:
                     leftover, minibatch = clients[indices[0]].get()
                     if pin_memory:
@@ -128,7 +128,8 @@ def reconstruct_data(clients, data_queue, max_queue_size, close_event, device, p
                     for client in clients:
                         client.close()
                     raise RuntimeError(str(e))
-            time.sleep(0.001)
+            else:
+                time.sleep(0.001)
     else:
         # create a buffer
         internal_queue = Queue()
@@ -136,7 +137,7 @@ def reconstruct_data(clients, data_queue, max_queue_size, close_event, device, p
             if close_event.is_set():
                 return
 
-            if data_queue.qsize() < max_queue_size:
+            if data_queue.qsize() <= max_queue_size:
                 try:
                     leftover, minibatch = clients[indices[0]].get()
                     if pin_memory:
@@ -162,7 +163,102 @@ def reconstruct_data(clients, data_queue, max_queue_size, close_event, device, p
                     for client in clients:
                         client.close()
                     raise RuntimeError(str(e))
-            time.sleep(0.001)
+            else:
+                time.sleep(0.001)
+
+try:
+    from PySide6.QtCore import QObject, QThread
+
+    class DataFetcher(QObject):
+        def __init__(self, clients, data_queue, max_queue_size, device, pin_memory):
+            super().__init__()
+            self.clients = clients
+            self.data_queue = data_queue
+            self.max_queue_size = max_queue_size
+            self.device = device
+            self.pin_memory = pin_memory
+            self.close_signal = Queue()
+
+        def run(self):
+            # get the sample from the 1st client in the client list
+            nb_client = len(self.clients)
+            indices = list(range(nb_client))
+
+            if self.device is None:
+                # handle the case when no device is specified
+                while True:
+                    if not self.close_signal.empty():
+                        logger.info(f'receive signal to close reconstruction process')
+                        return
+
+                    if self.data_queue.qsize() < self.max_queue_size:
+                        try:
+                            leftover, minibatch = self.clients[indices[0]].get()
+                            if self.pin_memory:
+                                self.data_queue.put([x.pin_memory() for x in minibatch])
+                            else:
+                                self.data_queue.put(minibatch)
+
+                            if leftover == 0:
+                                # remove the client from the list
+                                indices.pop(0)
+                                if len(indices) == 0:
+                                    # if empty, reinitialize
+                                    indices = list(range(nb_client))
+                            else:
+                                # rotate the list
+                                indices.append(indices.pop(0))
+
+                        except RuntimeError as e:
+                            # put None to data queue
+                            # then put error message
+                            self.data_queue.put(None)
+                            self.data_queue.put(str(e))
+                            for client in self.clients:
+                                client.close()
+                            raise RuntimeError(str(e))
+                    else:
+                        time.sleep(0.001)
+            else:
+                while True:
+                    if self.close_event.is_set():
+                        return
+
+                    if self.data_queue.qsize() < self.max_queue_size:
+                        try:
+                            leftover, minibatch = self.clients[indices[0]].get()
+                            if self.pin_memory:
+                                self.data_queue.put(
+                                    [x.pin_memory().to(self.device, non_blocking=True) for x in minibatch]
+                                )
+                            else:
+                                self.data_queue.put(
+                                    [x.to(self.device, non_blocking=True) for x in minibatch]
+                                )
+
+                            if leftover == 0:
+                                # remove the client from the list
+                                indices.pop(0)
+                                if len(indices) == 0:
+                                    # if empty, reinitialize
+                                    indices = list(range(self.nb_client))
+                            else:
+                                # rotate the list
+                                indices.append(indices.pop(0))
+
+                        except RuntimeError as e:
+                            # put None to data queue
+                            # then put error message
+                            self.data_queue.put(None)
+                            self.data_queue.put(str(e))
+                            for client in self.clients:
+                                client.close()
+                            raise RuntimeError(str(e))
+                    else:
+                        time.sleep(0.001)
+
+except ImportError:
+    DataFetcher = None
 
 
 class DatasetClient:
@@ -292,6 +388,8 @@ class AsyncDataLoader:
         wait_time=10,
         client_wait_time=10,
         nb_retry=10,
+        gpu_indices=None,
+        qt_threading=False,
     ):
         try:
             dataset_tmp = dataset_class(**dataset_params)
@@ -299,6 +397,9 @@ class AsyncDataLoader:
         except Exception as error:
             logger.warning('failed to construct the dataset with the following error')
             raise error
+
+        if gpu_indices is not None:
+            assert len(gpu_indices) == nb_servers
 
         # start the servers
         logger.info('starting services, this will take a while')
@@ -311,11 +412,16 @@ class AsyncDataLoader:
             max_queue_size=max_queue_size,
             shuffle=shuffle,
             packet_size=packet_size,
+            gpu_indices=gpu_indices,
         )
         self.wait_for_servers()
 
         self.is_closed = False
         self.is_client_available = False
+        if qt_threading and DataFetcher is not None:
+            self.qt_threading = True
+        else:
+            self.qt_threading = False
 
         # start clients
         self.start_clients(packet_size, client_wait_time, nb_retry)
@@ -327,12 +433,29 @@ class AsyncDataLoader:
 
         # start the thread to reconstruct data and put them into a queue
         self.data_queue = Queue()
-        self.close_event = threading.Event()
-        self.data_thread = threading.Thread(
-            target=reconstruct_data,
-            args=(self.clients, self.data_queue, max_queue_size, self.close_event, device, pin_memory)
-        )
-        self.data_thread.start()
+
+        if not self.qt_threading:
+            # use python threading
+            self.close_event = threading.Event()
+            self.data_thread = threading.Thread(
+                target=reconstruct_data,
+                args=(self.clients, self.data_queue, max_queue_size, self.close_event, device, pin_memory)
+            )
+            self.data_thread.start()
+        else:
+            # use qt threading
+            self.data_thread = QThread()
+            self.data_fetcher = DataFetcher(
+                self.clients,
+                self.data_queue,
+                max_queue_size,
+                device,
+                pin_memory,
+            )
+            self.data_fetcher.moveToThread(self.data_thread)
+            self.data_thread.started.connect(self.data_fetcher.run)
+            self.data_thread.start()
+
 
         # wait a bit to generate some samples before returning
         logger.info(f'waiting {wait_time} seconds to preload some samples')
@@ -392,22 +515,28 @@ class AsyncDataLoader:
             logger.info('closing the AsyncDataLoader instance')
             # close the thread running DatasetClient
             if self.is_client_available:
-                self.close_event.set()
-                self.data_thread.join()
                 for client in self.clients:
                     client.close()
+
+                if not self.qt_threading:
+                    self.close_event.set()
+                    self.data_thread.join()
+                else:
+                    self.data_fetcher.close_signal.put(None)
+                    self.data_thread.quit()
+                    self.data_thread.wait()
 
             # close the dataset servers
             for server in self.servers:
                 server.kill()
 
-            self.is_closed = True
-            self.is_client_available = False
-
             # delete status files
             for file in self.status_files:
                 if os.path.exists(file):
                     os.remove(file)
+
+            self.is_closed = True
+            self.is_client_available = False
 
     def start_servers(
         self,
@@ -419,6 +548,7 @@ class AsyncDataLoader:
         max_queue_size: int,
         shuffle: bool,
         packet_size: int,
+        gpu_indices: list,
     ):
         """
         start the dataset servers
@@ -445,6 +575,14 @@ class AsyncDataLoader:
         self.ports = []
         for server_idx in range(nb_servers):
             logger.info(f'starting dataset server {server_idx +1}')
+            all_env_var = os.environ.copy()
+            if gpu_indices is not None:
+                indices = gpu_indices[server_idx]
+                if isinstance(indices, int):
+                    indices = [indices,]
+                env_var = ','.join([str(v) for v in indices])
+                all_env_var['CUDA_VISIBLE_DEVICES'] = env_var
+
             process = subprocess.Popen(
                 [
                     'serve-dataset',
@@ -468,7 +606,8 @@ class AsyncDataLoader:
                     str(packet_size),
                     '--status-file',
                     status_files[server_idx],
-                ]
+                ],
+                env=all_env_var,
             )
             time.sleep(2)
             self.servers.append(process)
