@@ -94,16 +94,21 @@ def test_cache_server(qt_threading):
     dataloader.close()
     logger.info('complete testing caching on server side')
 
-def test_rotation(qt_threading):
-    logger.info(f'test rotation feature with qt_threading={qt_threading}')
-    rotation_setting = {'rotation': 3, 'min_rotation_size': 10, 'max_rotation_size': 100}
+def test_rotation_on_memory(qt_threading):
+    logger.info(f'test rotation on memory feature with qt_threading={qt_threading}')
+    rotation_setting = {
+        'rotation': 3,
+        'min_rotation_size': 10,
+        'max_rotation_size': 100,
+        'rotation_medium': 'memory',
+    }
     dataloader = AsyncDataLoader(
         dataset_class=Dataset,
         dataset_params={'train': True},
         batch_size=64,
         nb_servers=1,
         start_port=50000,
-        max_queue_size=128,
+        max_queue_size=10,
         qt_threading=qt_threading,
         nearby_shuffle=100,
         rotation_setting=rotation_setting,
@@ -116,10 +121,41 @@ def test_rotation(qt_threading):
 
     stop = time.time()
     dataloader.close()
-    logger.info('complete testing rotation')
+    logger.info('complete testing rotation on memory')
+
+def test_rotation_on_disk(qt_threading):
+    logger.info(f'test rotation on disk feature with qt_threading={qt_threading}')
+    rotation_setting = {
+        'rotation': 3,
+        'min_rotation_size': 2,
+        'max_rotation_size': 200,
+        'rotation_medium': 'disk',
+        'rotation_file_prefix': './data/rot_data',
+    }
+    dataloader = AsyncDataLoader(
+        dataset_class=Dataset,
+        dataset_params={'train': True},
+        batch_size=64,
+        nb_servers=1,
+        start_port=50000,
+        max_queue_size=10,
+        qt_threading=qt_threading,
+        nearby_shuffle=100,
+        rotation_setting=rotation_setting,
+    )
+
+    start = time.time()
+    for _ in range(6):
+        for samples in tqdm(dataloader):
+            pass
+
+    stop = time.time()
+    dataloader.close()
+    logger.info('complete testing rotation on disk')
 
 if __name__ == '__main__':
     #---------------------------------------
-    test_cache_server(False)
-    test_cache_client(False)
-    test_rotation(False)
+    #test_cache_server(False)
+    #test_cache_client(False)
+    test_rotation_on_memory(False)
+    test_rotation_on_disk(False)

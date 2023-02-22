@@ -54,6 +54,8 @@ class BinaryBlob(TorchDataset):
     def __init__(self, binary_file: str, index_file: str, mode='r'):
         assert mode in ['r', 'w']
         self._mode = 'write' if mode == 'w' else 'read'
+        self._binary_file = binary_file
+        self._index_file = index_file
 
         if mode == 'w':
             # writing mode
@@ -90,6 +92,12 @@ class BinaryBlob(TorchDataset):
 
     def mode(self):
         return self._mode
+
+    def binary_file(self):
+        return self._binary_file
+
+    def index_file(self):
+        return self._index_file
 
     def __getitem__(self, i: int):
         if self._mode == 'write':
