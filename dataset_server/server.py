@@ -453,6 +453,7 @@ class DataloaderServer(TaskThread):
 
     def initVars__(self):
         self.server = None
+        self.server_started = False
         self.tasks.tcp_server = None
         self.tasks.generate_sample = None
         self.tasks.read_sample = None
@@ -669,6 +670,9 @@ class DataloaderServer(TaskThread):
             nb_mini_batch = int(np.ceil(self.total_sample / self.batch_size))
             self.dataset_length.put(nb_mini_batch)
 
+            while not self.server_started:
+                await asyncio.sleep(0.1)
+
             with open(self.status_file, 'w') as fid:
                 fid.write('ready')
 
@@ -701,14 +705,17 @@ class DataloaderServer(TaskThread):
         except asyncio.CancelledError:
             self.print_warning('tcp_server__', 'got canceled')
             self.server = None
+            self.server_started = False
 
         except Exception as e:
             logger.warning(f"tcp_server__: failed with {e}")
             logger.warning(f"tcp_server__: will try again in {self.retry_interval} secs")
             await asyncio.sleep(self.retry_interval)
+            self.server_started = False
             self.tasks.tcp_server = await reSchedule(self.tcp_server__)
         else:
             logger.info("tcp_server__ : new server waiting")
+            self.server_started = True
 
     @verbose
     async def new_connection_handler__(self, reader, writer):
