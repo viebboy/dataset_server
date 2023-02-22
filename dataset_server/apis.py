@@ -104,11 +104,32 @@ def pin_data_memory(x):
     else:
         return x.pin_memory()
 
-def reconstruct_data(
-    clients,
+def rotate_data(
     data_queue,
     rotation_queue,
     max_rotation_size,
+    close_event,
+):
+    while True:
+        if close_event.is_set():
+            logger.info(f'receive signal to close rotate data thread thread, closing now...')
+            return
+
+        r_size = rotation_queue.qsize()
+        if r_size <= max_rotation_size:
+            for _ in range(max_rotation_size + 1 - r_size):
+                if not data_queue.empty():
+                    minibatch = data_queue.get()
+                    rotation_queue.put((1, minibatch))
+                else:
+                    break
+        else:
+            time.sleep(0.001)
+
+
+def fetch_data(
+    clients,
+    data_queue,
     max_queue_size,
     close_event,
     pin_memory,
@@ -142,7 +163,7 @@ def reconstruct_data(
     # handle the case when no device is specified
     while True:
         if close_event.is_set():
-            logger.info(f'receive signal to close reconstruction process')
+            logger.info(f'receive signal to close data fetcher thread')
             if record is not None:
                 record.close()
             return
@@ -163,15 +184,6 @@ def reconstruct_data(
                     from_server = True
                 else:
                     from_server = False
-
-        r_size = rotation_queue.qsize()
-        if r_size <= max_rotation_size:
-            for _ in range(max_rotation_size + 1 - r_size):
-                if not data_queue.empty():
-                    minibatch = data_queue.get()
-                    rotation_queue.put((1, minibatch))
-                else:
-                    break
 
         if data_queue.qsize() <= max_queue_size:
             try:
@@ -264,8 +276,6 @@ try:
             self,
             clients,
             data_queue,
-            rotation_queue,
-            max_rotation_size,
             max_queue_size,
             pin_memory,
             cache_setting
@@ -277,16 +287,12 @@ try:
             self.pin_memory = pin_memory
             self.close_signal = Queue()
             self.cache_setting = cache_setting
-            self.rotation_queue = rotation_queue
-            self.max_rotation_size = max_rotation_size
 
         def run(self):
             # get the sample from the 1st client in the client list
-            reconstruct_data(
+            fetch_data(
                 clients=self.clients,
                 data_queue=self.data_queue,
-                rotation_queue=self.rotation_queue,
-                max_rotation_size=self.max_rotation_size,
                 max_queue_size=self.max_queue_size,
                 close_event=CloseEvent(self.close_signal),
                 pin_memory=self.pin_memory,
@@ -294,8 +300,32 @@ try:
             )
 
 
+    class DataRotator(QObject):
+        def __init__(
+            self,
+            data_queue,
+            rotation_queue,
+            max_rotation_size,
+        ):
+            super().__init__()
+            self.data_queue = data_queue
+            self.rotation_queue = rotation_queue
+            self.max_rotation_size = max_rotation_size
+            self.close_signal = Queue()
+
+        def run(self):
+            # get the sample from the 1st client in the client list
+            rotate_data(
+                data_queue=self.data_queue,
+                rotation_queue=self.rotation_queue,
+                max_rotation_size=self.max_rotation_size,
+                close_event=CloseEvent(self.close_signal),
+            )
+
+
 except ImportError:
     DataFetcher = None
+    DataRotator = None
 
 
 class DatasetClient:
@@ -429,9 +459,7 @@ class AsyncDataLoader:
         qt_threading=False,
         nearby_shuffle: int=0,
         cache_setting=None,
-        rotation: int=1,
-        min_rotation_size: int=1,
-        max_rotation_size: int=None,
+        rotation_setting=None,
     ):
         try:
             dataset_tmp = dataset_class(**dataset_params)
@@ -455,32 +483,26 @@ class AsyncDataLoader:
             assert 'update_frequency' in cache_setting
             assert cache_setting['update_frequency'] >= 2
 
-        assert isinstance(rotation, int)
-        assert rotation >= 1
-        if rotation > 1:
-            logger.warning(f'rotation option is ON. This means the dataset will be replicate {rotation} times')
+        if rotation_setting is None:
+            self.rotation = 1
+            self.min_rotation_size = 1
+            self.max_rotation_size = max_queue_size
+        else:
+            assert 'rotation' in rotation_setting
+            assert 'min_rotation_size' in rotation_setting
+            assert 'max_rotation_size' in rotation_setting
 
-        if rotation > 1:
-            # there is rotation
-            if not isinstance(min_rotation_size, int) or min_rotation_size <= 1:
-                msg = (
-                    'min_rotation_size must be an int and larger than 1; ',
-                    f'received min_rotation_size={min_rotation_size}'
-                )
-                raise RuntimeError(''.join(msg))
-            if not isinstance(max_rotation_size, int) or max_rotation_size <= 1:
-                msg = (
-                    'max_rotation_size must be an int and larger than 1; ',
-                    f'received max_rotation_size={max_rotation_size}'
-                )
-                raise RuntimeError(''.join(msg))
-
-        if max_rotation_size is None:
-            max_rotation_size = max_queue_size
-
-        self.rotation = rotation
-        self.min_rotation_size = min_rotation_size
-        self.max_rotation_size = max_rotation_size
+            assert rotation_setting['rotation'] >= 2
+            self.rotation = rotation_setting['rotation']
+            logger.warning(
+                f'rotation option is ON. This means the dataset will be replicate {self.rotation} times'
+            )
+            assert rotation_setting['min_rotation_size'] >= 2,\
+                'min_rotation_size must be at least 2'
+            self.min_rotation_size = rotation_setting['min_rotation_size']
+            assert rotation_setting['max_rotation_size'] >= 3,\
+                'max_rotation_size must be at least 3'
+            self.max_rotation_size = rotation_setting['max_rotation_size']
 
         # start the servers
         logger.info('starting services, this will take a while')
@@ -501,8 +523,21 @@ class AsyncDataLoader:
 
         self.is_closed = False
         self.is_client_available = False
-        if qt_threading and DataFetcher is not None:
-            self.qt_threading = True
+
+        if qt_threading:
+            msg = (
+                f'qt_threading option is True. To use threading from Qt framework, ',
+                'PySide6 needs to be installed'
+            )
+            logger.warning(''.join(msg))
+
+        if qt_threading:
+            if DataFetcher is not None and DataRotator is not None:
+                self.qt_threading = True
+                logger.warning('found working installation of Pyside6, QThread is in used')
+            else:
+                logger.warning('cannot find working installation of Pyside6, use default python threading')
+                self.qt_threading = False
         else:
             self.qt_threading = False
 
@@ -520,29 +555,39 @@ class AsyncDataLoader:
 
         if not self.qt_threading:
             # use python threading
-            self.close_event = threading.Event()
+            self.fetcher_close_event = threading.Event()
             self.data_thread = threading.Thread(
-                target=reconstruct_data,
+                target=fetch_data,
                 args=(
                     self.clients,
                     self.data_queue,
-                    self.rotation_queue,
-                    max_rotation_size,
                     max_queue_size,
-                    self.close_event,
+                    self.fetcher_close_event,
                     pin_memory,
                     cache_setting,
                 )
             )
             self.data_thread.start()
+
+            # thread for data rotation
+            self.rotator_close_event = threading.Event()
+            self.rotator_thread = threading.Thread(
+                target=rotate_data,
+                args=(
+                    self.data_queue,
+                    self.rotation_queue,
+                    self.max_rotation_size,
+                    self.rotator_close_event,
+                )
+            )
+            self.rotator_thread.start()
+
         else:
             # use qt threading
             self.data_thread = QThread()
             self.data_fetcher = DataFetcher(
                 clients=self.clients,
                 data_queue=self.data_queue,
-                rotation_queue=self.rotation_queue,
-                max_rotation_size=self.max_rotation_size,
                 max_queue_size=max_queue_size,
                 pin_memory=pin_memory,
                 cache_setting=cache_setting,
@@ -550,6 +595,17 @@ class AsyncDataLoader:
             self.data_fetcher.moveToThread(self.data_thread)
             self.data_thread.started.connect(self.data_fetcher.run)
             self.data_thread.start()
+
+            self.rotator_thread = QThread()
+            self.data_rotator = DataRotator(
+                data_queue=self.data_queue,
+                rotation_queue=self.rotation_queue,
+                max_rotation_size=self.max_rotation_size,
+            )
+            self.data_rotator.moveToThread(self.rotator_thread)
+            self.rotator_thread.started.connect(self.data_rotator.run)
+            self.rotator_thread.start()
+
 
         # wait a bit to generate some samples before returning
         logger.info(f'waiting {wait_time} seconds to preload some samples')
@@ -610,12 +666,15 @@ class AsyncDataLoader:
             # close the thread running DatasetClient
             if self.is_client_available:
                 if not self.qt_threading:
-                    self.close_event.set()
+                    self.fetcher_close_event.set()
+                    self.rotator_close_event.set()
                     self.data_thread.join()
+                    self.rotator_thread.join()
                 else:
                     self.data_fetcher.close_signal.put(None)
+                    self.data_rotator.close_signal.put(None)
                     self.data_thread.quit()
-                    self.data_thread.wait()
+                    self.rotator_thread.wait()
 
                 for client in self.clients:
                     client.close()
@@ -778,21 +837,41 @@ class AsyncDataLoader:
 class AsyncDataset(AsyncDataLoader):
     def __init__(
         self,
-        dataset_module_file: str,
+        dataset_class,
         dataset_params: dict,
         nb_servers: int,
-        start_port: int,
-        max_queue_size: int,
+        start_port: int=11111,
+        max_queue_size: int=20,
+        shuffle: bool=False,
         device=None,
         pin_memory=False,
+        packet_size=125000,
+        wait_time=10,
+        client_wait_time=10,
+        nb_retry=10,
+        gpu_indices=None,
+        qt_threading=False,
+        nearby_shuffle: int=0,
+        cache_setting=None,
+        rotation_setting=None,
     ):
         super().__init__(
-            dataset_module_file=dataset_module_file,
+            dataset_class=dataset_class,
             dataset_params=dataset_params,
-            batch_size=1,
             nb_servers=nb_servers,
             start_port=start_port,
+            batch_size=1,
             max_queue_size=max_queue_size,
+            shuffle=shuffle,
             device=device,
             pin_memory=pin_memory,
+            packet_size=packet_size,
+            wait_time=wait_time,
+            client_wait_time=client_wait_time,
+            nb_retry=nb_retry,
+            gpu_indices=gpu_indices,
+            qt_threading=qt_threading,
+            nearby_shuffle=nearby_shuffle,
+            cache_setting=cache_setting,
+            rotation_setting=rotation_setting,
         )

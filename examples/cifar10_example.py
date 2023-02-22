@@ -17,8 +17,8 @@ class Dataset(CIFAR10):
         x = np.asarray(x)
         return x, y
 
-def test_default():
-    logger.info('test default setting')
+def test_default(qt_threading):
+    logger.info(f'test default setting with qt_threading={qt_threading}')
     dataloader = AsyncDataLoader(
         dataset_class=Dataset,
         dataset_params={'train': True},
@@ -26,7 +26,7 @@ def test_default():
         nb_servers=1,
         start_port=50000,
         max_queue_size=128,
-        qt_threading=False,
+        qt_threading=qt_threading,
     )
 
     start = time.time()
@@ -36,8 +36,8 @@ def test_default():
     dataloader.close()
     logger.info('complete testing the default config')
 
-def test_cache_client():
-    logger.info('test caching setting in client side')
+def test_cache_client(qt_threading):
+    logger.info(f'test caching setting in client side with qt_threading={qt_threading}')
     cache_setting = {
         'cache_side': 'client',
         'cache_prefix': './data/train_cache',
@@ -51,7 +51,7 @@ def test_cache_client():
         nb_servers=1,
         start_port=50000,
         max_queue_size=128,
-        qt_threading=False,
+        qt_threading=qt_threading,
         nearby_shuffle=100,
         cache_setting=cache_setting,
     )
@@ -65,13 +65,13 @@ def test_cache_client():
     dataloader.close()
     logger.info('complete testing caching on client side')
 
-def test_cache_server():
-    logger.info('test caching setting in server side')
+def test_cache_server(qt_threading):
+    logger.info(f'test caching setting in server side with qt_threading={qt_threading}')
     cache_setting = {
         'cache_side': 'server',
         'cache_prefix': './data/train_cache',
-        'rewrite': False,
-        'update_frequency': 3,
+        'rewrite': True,
+        'update_frequency': np.inf,
     }
     dataloader = AsyncDataLoader(
         dataset_class=Dataset,
@@ -80,7 +80,7 @@ def test_cache_server():
         nb_servers=1,
         start_port=50000,
         max_queue_size=128,
-        qt_threading=False,
+        qt_threading=qt_threading,
         nearby_shuffle=100,
         cache_setting=cache_setting,
     )
@@ -94,8 +94,9 @@ def test_cache_server():
     dataloader.close()
     logger.info('complete testing caching on server side')
 
-def test_rotation():
-    logger.info('test rotation feature')
+def test_rotation(qt_threading):
+    logger.info(f'test rotation feature with qt_threading={qt_threading}')
+    rotation_setting = {'rotation': 3, 'min_rotation_size': 10, 'max_rotation_size': 100}
     dataloader = AsyncDataLoader(
         dataset_class=Dataset,
         dataset_params={'train': True},
@@ -103,11 +104,9 @@ def test_rotation():
         nb_servers=1,
         start_port=50000,
         max_queue_size=128,
-        qt_threading=False,
+        qt_threading=qt_threading,
         nearby_shuffle=100,
-        rotation=3,
-        min_rotation_size=10,
-        max_rotation_size=1000,
+        rotation_setting=rotation_setting,
     )
 
     start = time.time()
@@ -121,6 +120,6 @@ def test_rotation():
 
 if __name__ == '__main__':
     #---------------------------------------
-    test_cache_server()
-    #test_cache_client()
-    #test_rotation()
+    test_cache_server(False)
+    test_cache_client(False)
+    test_rotation(False)
