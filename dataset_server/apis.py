@@ -211,18 +211,15 @@ def fetch_data(
                 if r_size <= max_queue_size:
                     if rotation_records[0].mode() == 'read':
                         # if there is rotation record for reading
-                        for _ in range(max_queue_size + 1 - r_size):
-                            if len(rot_read_indices) > 0:
-                                idx = rot_read_indices.pop(0)
-                                minibatch = rotation_records[0].read_index(idx)
-                                # putting rot together with minibatch to
-                                # prevent __next__() in asyncloader putting
-                                # this minibatch batch
-                                # basically rotation is handled in this
-                                # function
-                                rotation_queue.put((rotation, minibatch))
-                            else:
-                                break
+                        if len(rot_read_indices) > 0:
+                            idx = rot_read_indices.pop(0)
+                            minibatch = rotation_records[0].read_index(idx)
+                            # putting rot together with minibatch to
+                            # prevent __next__() in asyncloader putting
+                            # this minibatch batch
+                            # basically rotation is handled in this
+                            # function
+                            rotation_queue.put((rotation, minibatch))
 
                         # if we run out of indices, we need to increase
                         # rot_counter, which keeps track of how many rotations on
