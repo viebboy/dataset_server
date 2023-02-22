@@ -252,7 +252,7 @@ def fetch_data(
                     if rotation_records[1].mode() == 'write':
                         # if 2nd record is in write mode, we need get from
                         # data_queue and write to records
-                        if not data_queue.empty():
+                        while not data_queue.empty():
                             minibatch = data_queue.get()
                             rotation_records[1].write_index(rot_write_idx, minibatch)
                             # if 1st record in write mode, we need to also put
