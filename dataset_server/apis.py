@@ -130,6 +130,8 @@ def rotate_data(
 def fetch_data(
     clients,
     data_queue,
+    rotation_queue,
+    max_rotation_size,
     max_queue_size,
     close_event,
     pin_memory,
@@ -163,10 +165,20 @@ def fetch_data(
     # handle the case when no device is specified
     while True:
         if close_event.is_set():
-            logger.info(f'receive signal to close data fetcher thread')
+            logger.info(f'receive signal to close data fetcher thread, closing now...')
             if record is not None:
                 record.close()
             return
+
+        # move data from data_queue to rotation_queue
+        r_size = rotation_queue.qsize()
+        if r_size <= max_rotation_size:
+            for _ in range(max_rotation_size + 1 - r_size):
+                if not data_queue.empty():
+                    minibatch = data_queue.get()
+                    rotation_queue.put((1, minibatch))
+                else:
+                    break
 
         # check if sample should be reconstructed from server or from cache
         if record is None:
@@ -184,6 +196,7 @@ def fetch_data(
                     from_server = True
                 else:
                     from_server = False
+
 
         if data_queue.qsize() <= max_queue_size:
             try:
@@ -276,6 +289,8 @@ try:
             self,
             clients,
             data_queue,
+            rotation_queue,
+            max_rotation_size,
             max_queue_size,
             pin_memory,
             cache_setting
@@ -283,6 +298,8 @@ try:
             super().__init__()
             self.clients = clients
             self.data_queue = data_queue
+            self.rotation_queue = rotation_queue
+            self.max_rotation_size = max_rotation_size
             self.max_queue_size = max_queue_size
             self.pin_memory = pin_memory
             self.close_signal = Queue()
@@ -293,33 +310,12 @@ try:
             fetch_data(
                 clients=self.clients,
                 data_queue=self.data_queue,
+                rotation_queue=self.rotation_queue,
+                max_rotation_size=self.max_rotation_size,
                 max_queue_size=self.max_queue_size,
                 close_event=CloseEvent(self.close_signal),
                 pin_memory=self.pin_memory,
                 cache_setting=self.cache_setting,
-            )
-
-
-    class DataRotator(QObject):
-        def __init__(
-            self,
-            data_queue,
-            rotation_queue,
-            max_rotation_size,
-        ):
-            super().__init__()
-            self.data_queue = data_queue
-            self.rotation_queue = rotation_queue
-            self.max_rotation_size = max_rotation_size
-            self.close_signal = Queue()
-
-        def run(self):
-            # get the sample from the 1st client in the client list
-            rotate_data(
-                data_queue=self.data_queue,
-                rotation_queue=self.rotation_queue,
-                max_rotation_size=self.max_rotation_size,
-                close_event=CloseEvent(self.close_signal),
             )
 
 
@@ -532,7 +528,7 @@ class AsyncDataLoader:
             logger.warning(''.join(msg))
 
         if qt_threading:
-            if DataFetcher is not None and DataRotator is not None:
+            if DataFetcher is not None:
                 self.qt_threading = True
                 logger.warning('found working installation of Pyside6, QThread is in used')
             else:
@@ -561,6 +557,8 @@ class AsyncDataLoader:
                 args=(
                     self.clients,
                     self.data_queue,
+                    self.rotation_queue,
+                    self.max_rotation_size,
                     max_queue_size,
                     self.fetcher_close_event,
                     pin_memory,
@@ -568,26 +566,14 @@ class AsyncDataLoader:
                 )
             )
             self.data_thread.start()
-
-            # thread for data rotation
-            self.rotator_close_event = threading.Event()
-            self.rotator_thread = threading.Thread(
-                target=rotate_data,
-                args=(
-                    self.data_queue,
-                    self.rotation_queue,
-                    self.max_rotation_size,
-                    self.rotator_close_event,
-                )
-            )
-            self.rotator_thread.start()
-
         else:
             # use qt threading
             self.data_thread = QThread()
             self.data_fetcher = DataFetcher(
                 clients=self.clients,
                 data_queue=self.data_queue,
+                rotation_queue=self.rotation_queue,
+                max_rotation_size=self.max_rotation_size,
                 max_queue_size=max_queue_size,
                 pin_memory=pin_memory,
                 cache_setting=cache_setting,
@@ -595,17 +581,6 @@ class AsyncDataLoader:
             self.data_fetcher.moveToThread(self.data_thread)
             self.data_thread.started.connect(self.data_fetcher.run)
             self.data_thread.start()
-
-            self.rotator_thread = QThread()
-            self.data_rotator = DataRotator(
-                data_queue=self.data_queue,
-                rotation_queue=self.rotation_queue,
-                max_rotation_size=self.max_rotation_size,
-            )
-            self.data_rotator.moveToThread(self.rotator_thread)
-            self.rotator_thread.started.connect(self.data_rotator.run)
-            self.rotator_thread.start()
-
 
         # wait a bit to generate some samples before returning
         logger.info(f'waiting {wait_time} seconds to preload some samples')
@@ -667,14 +642,10 @@ class AsyncDataLoader:
             if self.is_client_available:
                 if not self.qt_threading:
                     self.fetcher_close_event.set()
-                    self.rotator_close_event.set()
                     self.data_thread.join()
-                    self.rotator_thread.join()
                 else:
                     self.data_fetcher.close_signal.put(None)
-                    self.data_rotator.close_signal.put(None)
                     self.data_thread.quit()
-                    self.rotator_thread.wait()
 
                 for client in self.clients:
                     client.close()
