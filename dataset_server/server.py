@@ -454,17 +454,28 @@ class DataloaderServer(TaskThread):
     def initVars__(self):
         self.server = None
         self.server_started = False
+
+        # list of tasks
         self.tasks.tcp_server = None
-        self.tasks.generate_sample = None
-        self.tasks.read_sample = None
-        self.tasks.generate_minibatch = None
+        self.tasks.generate_sample_without_rotation = None
+        self.tasks.generate_minibatch_without_rotation = None
+        self.tasks.generate_sample_with_rotation = None
+        self.tasks.generate_minibatch_with_rotation = None
+        self.tasks.move_minibatch = None
         self.tasks.load_dataset = None
-        self.sample_queue = Queue()
+
         self.dataset_length = Queue()
+
+        # this holds lists of samples to be concatenated
+        self.sample_queue = Queue()
+        self.sample_queue_counter = self.max_queue_size
+
+        # this holds ready minibatches to be sent
+        # this queue is shared by both the telcom thread
+        # and the main thread
         self.minibatch_queue = Queue()
         self.current_minibatch = [[]]
         self.batcher_created = False
-        self.sample_reader_created = False
         self.record = None
         self.cache_update_frequency = 0
         self.current_epoch = 0
@@ -480,25 +491,48 @@ class DataloaderServer(TaskThread):
 
     @verbose
     async def move_minibatch(self):
-        # move the current minibatch into sample_queue for batching
-        # start generate minibatch task
-        # reset the current minibatch
+        try:
+            # move the current minibatch into sample_queue for batching
+            # start generate minibatch task
+            # reset the current minibatch
 
-        self.sample_queue.put(self.current_minibatch.pop(0))
-        # launch the task to perform batching and send it to children
-        if not self.batcher_created:
-            # if not yet started for the 1st time, then created
-            self.tasks.generate_minibatch = await reCreate(
-                self.tasks.generate_minibatch,
-                self.generate_minibatch__
+            self.sample_queue.put(self.current_minibatch.pop(0))
+            # launch the task to perform batching and send it to children
+            if not self.batcher_created:
+                # if not yet started for the 1st time, then created
+                if self.rotation_setting is None:
+                    self.tasks.generate_minibatch_without_rotation = await reCreate(
+                        self.tasks.generate_minibatch_without_rotation,
+                        self.generate_minibatch_without_rotation__
+                    )
+                else:
+                    self.tasks.generate_minibatch_with_rotation = await reCreate(
+                        self.tasks.generate_minibatch_with_rotation,
+                        self.generate_minibatch_with_rotation__
+                    )
+
+                self.batcher_created = True
+            else:
+                # schedule the task to run
+                if self.rotation_setting is None:
+                    self.tasks.generate_minibatch_without_rotation = await reSchedule(
+                        self.generate_minibatch_without_rotation__
+                    )
+                else:
+                    self.tasks.generate_minibatch_with_rotation = await reSchedule(
+                        self.generate_minibatch_with_rotation__
+                    )
+
+            # reset
+            self.current_minibatch = [[]]
+        except asyncio.CancelledError:
+            self.print_warning('move_minibatch_without_rotation__', 'got canceled')
+        except Exception as e:
+            await self.warn_and_exit(
+                'move_minibatch_without_rotation__',
+                str(e)
             )
-            self.batcher_created = True
-        else:
-            # schedule the task to run
-            self.tasks.generate_minibatch = await reSchedule(self.generate_minibatch__)
 
-        # reset
-        self.current_minibatch = [[]]
 
     def require_reading_from_dataset(self):
         if self.record is None:
@@ -519,14 +553,24 @@ class DataloaderServer(TaskThread):
         return from_dataset
 
     @verbose
-    async def generate_sample__(self):
+    async def generate_sample_without_rotation__(self):
         try:
             if len(self.current_minibatch[0]) == self.batch_size:
                 # reaching the size, need to start batching
-                await self.move_minibatch()
+                await self.move_minibatch_without_rotation()
             else:
                 # check if the current queue size exceeds the max
-                if self.minibatch_queue.qsize() <= self.max_queue_size:
+                if self.sample_queue_counter > 0:
+                    is_full = False
+                    self.sample_queue_counter -= 1
+                else:
+                    self.sample_queue_counter = self.max_queue_size
+                    if self.sample_queue.qsize() >= self.max_queue_size:
+                        is_full = True
+                    else:
+                        is_full = False
+
+                if not is_full:
                     # check whether sample is read from dataset or from cache
                     # get a sample and put in the current list
                     if self.require_reading_from_dataset():
@@ -585,16 +629,100 @@ class DataloaderServer(TaskThread):
                 else:
                     await asyncio.sleep(0.001)
 
-            self.tasks.generate_sample = await reSchedule(self.generate_sample__)
+            self.tasks.generate_sample_without_rotation = await reSchedule(
+                self.generate_sample_without_rotation__
+            )
 
         except asyncio.CancelledError:
-            self.print_warning('generate_sample__', 'got canceled')
+            self.print_warning('generate_sample_without_rotation__', 'got canceled')
         except Exception as e:
             await self.warn_and_exit(
-                'generate_sample__',
+                'generate_sample_without_rotation__',
                 str(e)
             )
 
+
+    @verbose
+    async def generate_sample_with_rotation__(self):
+        try:
+            if len(self.current_minibatch[0]) == self.batch_size:
+                # reaching the size, need to start batching
+                await self.move_minibatch()
+            else:
+                # check if the current queue size exceeds the max
+                if self.minibatch_queue.qsize() <= self.max_queue_size:
+                    # check whether sample is read from dataset or from cache
+                    # get a sample and put in the current list
+                    if self.require_reading_from_dataset():
+                        # if 1st sample, then close the current record that has
+                        # been used for reading and open again for writing
+                        if self.cur_idx == 0 and self.record is not None and self.record.mode() == 'read':
+                            self.record.close()
+                            self.record = BinaryBlob(self.cache_binary_file, self.cache_index_file, mode='w')
+
+                        idx = self.indices[self.cur_idx]
+                        sample = self.dataset[idx]
+
+                        # if not None, then write to record
+                        if self.record is not None:
+                            self.record.write_index(idx, sample)
+
+                        self.current_minibatch[0].append(sample)
+
+                        self.cur_idx += 1
+                        if self.cur_idx == self.total_sample:
+                            # this is the end of dataset
+                            # we need to batch this left-over part
+                            await self.move_minibatch_without_rotation()
+
+                            # reset the sample index counter and epoch counter
+                            self.cur_idx = 0
+                            self.current_epoch += 1
+                            # close the record that was in writing mode
+                            # and open again in reading mode
+                            if self.record is not None:
+                                self.record.close()
+                                self.record = BinaryBlob(
+                                    self.cache_binary_file,
+                                    self.cache_index_file,
+                                    mode='r',
+                                )
+
+                            # shuffle the indices if needed
+                            if self.shuffle:
+                                start_idx = min(self.indices)
+                                stop_idx = max(self.indices) + 1
+                                self.indices = shuffle_indices(start_idx, stop_idx, self.nearby_shuffle)
+                    else:
+                        # if we could read from record
+                        idx = self.indices[self.cur_idx]
+                        sample = self.record.read_index(idx)
+                        self.current_minibatch[0].append(sample)
+                        self.cur_idx += 1
+                        if self.cur_idx == self.total_sample:
+                            # again, reaching the end of the dataset
+                            # need to start batching
+                            await self.move_minibatch_without_rotation()
+                            # then reset the counter
+                            self.cur_idx = 0
+                            self.current_epoch += 1
+                else:
+                    await asyncio.sleep(0.001)
+
+            self.tasks.generate_sample_without_rotation = await reSchedule(
+                self.generate_sample_without_rotation__
+            )
+
+        except asyncio.CancelledError:
+            self.print_warning('generate_sample_without_rotation__', 'got canceled')
+        except Exception as e:
+            await self.warn_and_exit(
+                'generate_sample_without_rotation__',
+                str(e)
+            )
+
+
+    @verbose
     async def warn_and_exit(self, function_name, warning):
         if self.record is not None:
             self.record.close()
@@ -602,7 +730,7 @@ class DataloaderServer(TaskThread):
 
 
     @verbose
-    async def generate_minibatch__(self):
+    async def generate_minibatch_without_rotation__(self):
         # batching the samples and send to children
         try:
             if not self.sample_queue.empty():
@@ -610,10 +738,10 @@ class DataloaderServer(TaskThread):
                 minibatch = concatenate_list(samples, self.device)
                 self.minibatch_queue.put(minibatch)
         except asyncio.CancelledError:
-            self.print_warning('generate_minibatch__', 'got canceled')
+            self.print_warning('generate_minibatch_without_rotation__', 'got canceled')
         except Exception as e:
             await self.warn_and_exit(
-                'generate_minibatch__',
+                'generate_minibatch_without_rotation__',
                 str(e)
             )
 
@@ -718,8 +846,21 @@ class DataloaderServer(TaskThread):
     @verbose
     async def exit__(self):
         self.tasks.tcp_server = await delete(self.tasks.tcp_server)
-        self.tasks.generate_sample = await delete(self.tasks.generate_sample)
-        self.tasks.generate_minibatch = await delete(self.tasks.generate_minibatch)
+        # tasks with rotation
+        self.tasks.generate_sample_with_rotation = await delete(
+            self.tasks.generate_sample_with_rotation
+        )
+        self.tasks.generate_minibatch_with_rotation = await delete(
+            self.tasks.generate_minibatch_with_rotation
+        )
+        # tasks without rotation
+        self.tasks.generate_sample_without_rotation = await delete(
+            self.tasks.generate_sample_without_rotation
+        )
+        self.tasks.generate_minibatch_without_rotation = await delete(
+            self.tasks.generate_minibatch_without_rotation
+        )
+        self.tasks.move_minibatch = await delete(self.tasks.move_minibatch)
         self.tasks.load_dataset = await delete(self.tasks.load_dataset)
 
     @verbose
