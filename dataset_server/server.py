@@ -479,61 +479,83 @@ class DataloaderServer(TaskThread):
 
 
     @verbose
+    async def move_minibatch(self):
+        # move the current minibatch into sample_queue for batching
+        # start generate minibatch task
+        # reset the current minibatch
+
+        self.sample_queue.put(self.current_minibatch.pop(0))
+        # launch the task to perform batching and send it to children
+        if not self.batcher_created:
+            # if not yet started for the 1st time, then created
+            self.tasks.generate_minibatch = await reCreate(
+                self.tasks.generate_minibatch,
+                self.generate_minibatch__
+            )
+            self.batcher_created = True
+        else:
+            # schedule the task to run
+            self.tasks.generate_minibatch = await reSchedule(self.generate_minibatch__)
+
+        # reset
+        self.current_minibatch = [[]]
+
+    def require_reading_from_dataset(self):
+        if self.record is None:
+            from_dataset = True
+        else:
+            if self.current_epoch == 0:
+                # 1st epoch, if record in read mode
+                # it means cache exists, just need to read from cache
+                if self.record.mode() == 'read':
+                    from_dataset = False
+                else:
+                    from_dataset = True
+            else:
+                if self.current_epoch % self.cache_update_frequency == 0:
+                    from_dataset = True
+                else:
+                    from_dataset = False
+        return from_dataset
+
+    @verbose
     async def generate_sample__(self):
         try:
             if len(self.current_minibatch[0]) == self.batch_size:
-                # put the list of samples to tthe queue
-                self.sample_queue.put(self.current_minibatch.pop(0))
-
-                # launch the task to perform batching and send it to children
-                if not self.batcher_created:
-                    # if not yet started for the 1st time, then created
-                    self.tasks.generate_minibatch = await reCreate(
-                        self.tasks.generate_minibatch,
-                        self.generate_minibatch__
-                    )
-                    self.batcher_created = True
-                else:
-                    # schedule the task to run
-                    self.tasks.generate_minibatch = await reSchedule(self.generate_minibatch__)
-
-                self.current_minibatch = [[]]
+                # reaching the size, need to start batching
+                await self.move_minibatch()
             else:
                 # check if the current queue size exceeds the max
                 if self.minibatch_queue.qsize() <= self.max_queue_size:
                     # check whether sample is read from dataset or from cache
-                    if self.record is None:
-                        from_dataset = True
-                    else:
-                        if self.current_epoch == 0:
-                            # 1st epoch, if record in read mode
-                            # it means cache exists, just need to read from cache
-                            if self.record.mode() == 'read':
-                                from_dataset = False
-                            else:
-                                from_dataset = True
-                        else:
-                            if self.current_epoch % self.cache_update_frequency == 0:
-                                from_dataset = True
-                            else:
-                                from_dataset = False
-
                     # get a sample and put in the current list
-                    if from_dataset:
+                    if self.require_reading_from_dataset():
+                        # if 1st sample, then close the current record that has
+                        # been used for reading and open again for writing
                         if self.cur_idx == 0 and self.record is not None and self.record.mode() == 'read':
                             self.record.close()
                             self.record = BinaryBlob(self.cache_binary_file, self.cache_index_file, mode='w')
 
                         idx = self.indices[self.cur_idx]
                         sample = self.dataset[idx]
+
+                        # if not None, then write to record
                         if self.record is not None:
                             self.record.write_index(idx, sample)
 
                         self.current_minibatch[0].append(sample)
+
                         self.cur_idx += 1
                         if self.cur_idx == self.total_sample:
+                            # this is the end of dataset
+                            # we need to batch this left-over part
+                            await self.move_minibatch()
+
+                            # reset the sample index counter and epoch counter
                             self.cur_idx = 0
                             self.current_epoch += 1
+                            # close the record that was in writing mode
+                            # and open again in reading mode
                             if self.record is not None:
                                 self.record.close()
                                 self.record = BinaryBlob(
@@ -541,16 +563,23 @@ class DataloaderServer(TaskThread):
                                     self.cache_index_file,
                                     mode='r',
                                 )
+
+                            # shuffle the indices if needed
                             if self.shuffle:
                                 start_idx = min(self.indices)
                                 stop_idx = max(self.indices) + 1
                                 self.indices = shuffle_indices(start_idx, stop_idx, self.nearby_shuffle)
                     else:
+                        # if we could read from record
                         idx = self.indices[self.cur_idx]
                         sample = self.record.read_index(idx)
                         self.current_minibatch[0].append(sample)
                         self.cur_idx += 1
                         if self.cur_idx == self.total_sample:
+                            # again, reaching the end of the dataset
+                            # need to start batching
+                            await self.move_minibatch()
+                            # then reset the counter
                             self.cur_idx = 0
                             self.current_epoch += 1
                 else:
