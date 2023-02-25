@@ -561,13 +561,112 @@ class DataloaderServer(TaskThread):
 
         return from_dataset
 
+    @verbose
+    async def cache_rotation__(self):
+        """
+        this function writes data to self.rotation.records
+        and start batching
+
+        self.locks.check_record
+        self.locks.check_indices_to_ignore
+
+        self.rotation.disk.sample_counter = 0
+        self.rotation.disk.sample_write_idx = 0
+        self.rotation.disk.current_round = 0
+        self.rotation.disk.indices_to_read = []
+        self.rotation.disk.indices_to_ignore = []
+
+        IMPORTANT: we might want to continue writing as long as there's cache space
+        but we might not want to add samples to current_minibatch and batching because
+        the queue might be full so we NEED to check the size of minibatch_queue like
+        rotate_data_on_disk
+
+        """
+        try:
+            async with self.locks.check_record:
+                if self.rotation.records[1].mode() == 'write':
+                    can_write = True
+                    if self.rotation.records[0].mode() == 'write':
+                        # if 1st record is also in write mode, we need to do
+                        # the batching here
+                        need_batching = True
+                    else:
+                        need_batching = False
+                else:
+                    can_write = False
+                    need_batching = False
+
+            if can_write:
+                qsize = self.rotation.queue.qsize()
+                for _ in range(qsize):
+                    try:
+                        minibatch = self.rotation.queue.get(block=False)
+                        if minibatch is None:
+                            # this is the end of an epoch, need to wrap up this
+                            # record by closing and open again in read mode
+                            self.rotation.records[1].close()
+                            self.rotation.records[1] = BinaryBlob(
+                                binary_file=self.rotation.records[1].binary_file(),
+                                index_file=self.rotation.records[1].index_file(),
+                                mode='r',
+                            )
+
+                            # reset counter
+                            self.rotation.disk.sample_write_idx = 0
+
+                            # in addition, batching if needed
+                            if need_batching and len(self.current_minibatch[0]) > 0:
+                                await self.start_batching()
+
+                        else:
+                            # otherwise, write this sample to record
+                            self.rotation.records[1].write_index(
+                                self.rotation.disk.sample_write_idx,
+                                minibatch
+                            )
+
+                            # batching if needed
+                            if need_batching:
+                                self.current_minibatch[0].append(minibatch)
+                                # add this sample index to ignore list
+                                if len(self.current_minibatch[0]) == self.batch_size:
+                                    await self.start_batching()
+
+                            # increase counter
+                            self.rotation.disk.sample_write_idx += 1
+                            # check if reaching the maximum size of a record
+                            if self.rotation.disk.sample_write_idx == self.rotation.max_size:
+                                # close and open in read mode
+                                # also reset the counter
+                                self.rotation.disk.sample_write_idx = 0
+                                self.rotation.records[1].close()
+                                self.rotation.records[1] = BinaryBlob(
+                                    binary_file=self.rotation.records[1].binary_file(),
+                                    index_file=self.rotation.records[1].index_file(),
+                                    mode='r',
+                                )
+
+                    except queue.Empty():
+                        # empty read
+
+        except asyncio.CancelledError:
+            self.print_warning('cache_rotation__', 'got canceled')
+        except Exception as e:
+            await self.warn_and_exit(
+                'cache_rotation__',
+                str(e)
+            )
+
 
     @verbose
-    async def rotate_data_on_disk(self):
+    async def rotate_data_on_disk__(self):
         """
         this function reads data from self.rotation.records
         and start batching
         and keep track of how many times a sample has been rotated
+
+        self.locks.check_record
+        self.locks.check_indices_to_ignore
 
         self.rotation.disk.sample_counter = 0
         self.rotation.disk.current_round = 0
@@ -826,6 +925,10 @@ class DataloaderServer(TaskThread):
                         # reset the sample index counter and epoch counter
                         self.rotation.sample_idx = 0
                         self.ratotion.epoch_idx += 1
+
+                        # we need to put None into the queue to signify the end
+                        # of epoch
+                        self.rotation.queue.put(None)
 
                         # close the record that was in writing mode
                         # and open again in reading mode
@@ -1116,6 +1219,7 @@ class DataloaderServer(TaskThread):
                     self.rotation.records = [part_a, part_b]
                     # create counters for samples on disk
                     self.rotation.disk = Property()
+                    self.rotation.disk.sample_write_idx = 0
                     self.rotation.disk.sample_counter = 0
                     self.rotation.disk.current_round = 0
                     self.rotation.disk.indices_to_read = []
