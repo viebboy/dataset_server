@@ -186,3 +186,11 @@ class BinaryBlob(TorchDataset):
             self._fid.close()
         if self._idx_fid is not None:
             self._idx_fid.close()
+
+
+class Property:
+    """
+    property placeholder
+    """
+    def __init__(self):
+        pass
