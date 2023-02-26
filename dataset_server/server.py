@@ -456,7 +456,7 @@ class DataloaderServer(TaskThread):
         self.server = None
         self.server_started = False
         # locks
-        self.locks.index_changed = asyncio.Lock()
+        self.locks.queue_index_changed = asyncio.Lock()
         self.locks.check_record = asyncio.Lock()
 
         # list of tasks
@@ -835,7 +835,7 @@ class DataloaderServer(TaskThread):
                 # reaching the total sample, change the index now
                 self.rotation.read_sample_idx = 0
                 # change to index of the queue to read from
-                async with self.locks.index_changed:
+                async with self.locks.queue_index_changed:
                     self.rotation.read_queue_idx = 1 - self.rotation.read_queue_idx
                     # if there are samples in current_minibatch, we need to
                     # batch them too. Note that we dont want to wait until this
@@ -1003,22 +1003,22 @@ class DataloaderServer(TaskThread):
     @verbose
     async def generate_sample_with_rotation__(self):
         """
-                self.rotation.queue = [Queue(), Queue()]
-                self.rotation.queue_max_size = max(1, 0.5 * (self.max_queue_size)) * self.batch_size
-                self.rotation.queue_counter = max(1, 0.5 * (self.max_queue_size)) * self.batch_size
-                self.rotation.read_queue_idx = 0
-                self.rotation.read_sample_idx = 0
-                self.rotation.read_epoch_idx = 0
-                self.rotation.write_queue_idx = 0
-                self.rotation.write_sample_idx = 0
-                self.rotation.write_epoch_idx = 0
-                self.rotation.total_write = self.total_sample
-                self.rotation.total_read = self.total_sample * self.rotation.count
-                self.rotation.write_allowed = True
+        read sample from dataset and put them into the write queue of self.rotation.queue
+        there are 2 queues: one for reading and one for writing
+        in this function, data loaded from dataset will be written to the write queue
+        we need 2 queues because the data will also be rotated in these queues and
+        we need the rotation in an epoch to complete before the rotation in the next epoch starts
+
+        this task is scheduled to repeat indefinitely until canceled
+        this task is used when there is no rotation (max_rotation=1) or rotation is done on memory
         """
 
         try:
-            # check if whether the queue is too full
+            # check if whether the queue for writing is too full
+            # here we use queue_counter to avoid checking the size of a queue every time this task is run
+            # we start the queue_counter with the maximum size of the queue,
+            # then decreases every time this task is run
+            # when queue_counter == 0 --> we start the actual checking
             if self.rotation.queue_counter > 0:
                 is_full = False
                 self.rotation.queue_counter -= 1
@@ -1066,19 +1066,8 @@ class DataloaderServer(TaskThread):
 
                     # if reaching the total samples
                     if self.rotation.write_sample_idx == self.rotation.total_write:
-                        # reset the sample index counter and epoch counter
-                        self.rotation.write_sample_idx = 0
-                        self.ratotion.write_epoch_idx += 1
-
-                        async with self.locks.index_changed:
-                            # change the index of queue to write
-                            self.rotation.write_queue_idx = int(1 - self.rotation.write_queue_idx)
-                            # if read and write index are the same but read and write epoch are different
-                            # then it means we need to stop writing temporarily
-                            self.rotation.write_allowed = not (
-                                self.rotation.write_queue_idx == self.rotation.read_queue_idx and
-                                self.rotation.read_epoch_idx != self.rotation.write_epoch_idx
-                            )
+                        # reset the counter and change the index of queue to write
+                        await self.change_write_queue_index()
 
                         # close the record that was in writing mode
                         # and open again in reading mode
@@ -1102,27 +1091,18 @@ class DataloaderServer(TaskThread):
                     self.rotation.queue[self.rotation.write_queue_idx].put((1, sample))
 
                     self.rotation.write_sample_idx += 1
-                    if self.rotation.write_sample_idx == self.rotation.total_write:
-                        # reset the counter
-                        self.rotation.write_sample_idx = 0
-                        self.rotation.write_epoch_idx += 1
 
-                        async with self.locks.index_changed:
-                            # change the index of queue to write
-                            self.rotation.write_queue_idx = int(1 - self.rotation.write_queue_idx)
-                            # if read and write index are the same but read and write epoch are different
-                            # then it means we need to stop writing temporarily
-                            self.rotation.write_allowed = not (
-                                self.rotation.write_queue_idx == self.rotation.read_queue_idx and
-                                self.rotation.read_epoch_idx != self.rotation.write_epoch_idx
-                            )
+                    if self.rotation.write_sample_idx == self.rotation.total_write:
+                        # reset the counter and change the index of queue to write
+                        await self.change_write_queue_index()
+
             elif is_full:
                 # data queue is full, sleep a bit
                 await asyncio.sleep(0.001)
 
             elif not self.rotation.write_allowed:
                 # check again if writing is now allowed
-                async with self.locks.index_changed:
+                async with self.locks.queue_index_changed:
                     self.rotation.write_allowed = (
                         self.rotation.write_queue_idx != self.rotation.read_queue_idx or
                         self.rotation.read_epoch_idx == self.rotation.write_epoch_idx
@@ -1137,6 +1117,32 @@ class DataloaderServer(TaskThread):
         except Exception as e:
             await self.warn_and_exit(
                 'generate_sample_with_rotation__',
+                str(e)
+            )
+
+
+    @verbose
+    async def change_write_queue_index(self):
+        try:
+            # reset the counter
+            self.rotation.write_sample_idx = 0
+            self.rotation.write_epoch_idx += 1
+
+            async with self.locks.queue_index_changed:
+                # change the index of queue to write
+                self.rotation.write_queue_idx = int(1 - self.rotation.write_queue_idx)
+                # if read and write index are the same but read and write epoch are different
+                # then it means we need to stop writing temporarily
+                self.rotation.write_allowed = not (
+                    self.rotation.write_queue_idx == self.rotation.read_queue_idx and
+                    self.rotation.read_epoch_idx != self.rotation.write_epoch_idx
+                )
+
+        except asyncio.CancelledError:
+            self.print_warning('change_write_queue_index', 'got canceled')
+        except Exception as e:
+            await self.warn_and_exit(
+                'change_write_queue_index',
                 str(e)
             )
 
