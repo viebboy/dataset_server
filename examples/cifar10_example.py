@@ -28,6 +28,7 @@ def test_default(qt_threading):
         max_queue_size=128,
         qt_threading=qt_threading,
     )
+    print(f'data loader length: {len(dataloader)}')
 
     start = time.time()
     for samples in tqdm(dataloader):
@@ -36,12 +37,11 @@ def test_default(qt_threading):
     dataloader.close()
     logger.info('complete testing the default config')
 
-def test_cache_client(qt_threading):
-    logger.info(f'test caching setting in client side with qt_threading={qt_threading}')
+def test_cache_client():
+    logger.info(f'test caching setting in client side with')
     cache_setting = {
-        'cache_side': 'client',
-        'cache_prefix': './data/train_cache',
-        'rewrite': True,
+        'side': 'client',
+        'prefix': './data/train_cache',
         'update_frequency': 3,
     }
     dataloader = AsyncDataLoader(
@@ -51,10 +51,10 @@ def test_cache_client(qt_threading):
         nb_servers=1,
         start_port=50000,
         max_queue_size=128,
-        qt_threading=qt_threading,
         nearby_shuffle=100,
         cache_setting=cache_setting,
     )
+    print(f'data loader length: {len(dataloader)}')
 
     start = time.time()
     for _ in range(6):
@@ -65,12 +65,11 @@ def test_cache_client(qt_threading):
     dataloader.close()
     logger.info('complete testing caching on client side')
 
-def test_cache_server(qt_threading):
-    logger.info(f'test caching setting in server side with qt_threading={qt_threading}')
+def test_cache_server():
+    logger.info(f'test caching setting in server side')
     cache_setting = {
-        'cache_side': 'server',
-        'cache_prefix': './data/train_cache',
-        'rewrite': True,
+        'side': 'server',
+        'prefix': './data/train_cache',
         'update_frequency': np.inf,
     }
     dataloader = AsyncDataLoader(
@@ -80,10 +79,10 @@ def test_cache_server(qt_threading):
         nb_servers=1,
         start_port=50000,
         max_queue_size=128,
-        qt_threading=qt_threading,
         nearby_shuffle=100,
         cache_setting=cache_setting,
     )
+    print(f'data loader length: {len(dataloader)}')
 
     start = time.time()
     for _ in range(6):
@@ -94,13 +93,13 @@ def test_cache_server(qt_threading):
     dataloader.close()
     logger.info('complete testing caching on server side')
 
-def test_rotation_on_memory(qt_threading):
-    logger.info(f'test rotation on memory feature with qt_threading={qt_threading}')
-    rotation_setting = {
+def test_rotation_on_client_on_memory():
+    logger.info(f'test rotation on client on memory')
+    client_rotation_setting = {
         'rotation': 3,
         'min_rotation_size': 10,
         'max_rotation_size': 100,
-        'rotation_medium': 'memory',
+        'medium': 'memory',
     }
     dataloader = AsyncDataLoader(
         dataset_class=Dataset,
@@ -109,9 +108,8 @@ def test_rotation_on_memory(qt_threading):
         nb_servers=1,
         start_port=50000,
         max_queue_size=10,
-        qt_threading=qt_threading,
         nearby_shuffle=100,
-        rotation_setting=rotation_setting,
+        client_rotation_setting=client_rotation_setting,
     )
 
     start = time.time()
@@ -121,16 +119,15 @@ def test_rotation_on_memory(qt_threading):
 
     stop = time.time()
     dataloader.close()
-    logger.info('complete testing rotation on memory')
+    logger.info('complete testing rotation on client on memory')
 
-def test_rotation_on_disk(qt_threading):
-    logger.info(f'test rotation on disk feature with qt_threading={qt_threading}')
-    rotation_setting = {
+def test_rotation_on_server_on_memory():
+    logger.info(f'test rotation on server on memory')
+    server_rotation_setting = {
         'rotation': 3,
-        'min_rotation_size': 2,
-        'max_rotation_size': 200,
-        'rotation_medium': 'disk',
-        'rotation_file_prefix': './data/rot_data',
+        'min_rotation_size': 65,
+        'max_rotation_size': 1000,
+        'medium': 'memory',
     }
     dataloader = AsyncDataLoader(
         dataset_class=Dataset,
@@ -139,9 +136,8 @@ def test_rotation_on_disk(qt_threading):
         nb_servers=1,
         start_port=50000,
         max_queue_size=10,
-        qt_threading=qt_threading,
         nearby_shuffle=100,
-        rotation_setting=rotation_setting,
+        server_rotation_setting=server_rotation_setting,
     )
 
     start = time.time()
@@ -151,11 +147,75 @@ def test_rotation_on_disk(qt_threading):
 
     stop = time.time()
     dataloader.close()
-    logger.info('complete testing rotation on disk')
+    logger.info('complete testing rotation on client on memory')
+
+def test_rotation_on_client_on_disk():
+    logger.info(f'test rotation on client on disk')
+    client_rotation_setting = {
+        'rotation': 3,
+        'min_rotation_size': 10,
+        'max_rotation_size': 100,
+        'prefix': './data/client_rotation',
+        'medium': 'disk',
+    }
+    dataloader = AsyncDataLoader(
+        dataset_class=Dataset,
+        dataset_params={'train': True},
+        batch_size=64,
+        nb_servers=1,
+        start_port=50000,
+        max_queue_size=10,
+        nearby_shuffle=100,
+        client_rotation_setting=client_rotation_setting,
+    )
+
+    start = time.time()
+    for _ in range(6):
+        for samples in tqdm(dataloader):
+            pass
+
+    stop = time.time()
+    dataloader.close()
+    logger.info('complete testing rotation on client on disk')
+
+def test_rotation_on_server_on_disk():
+    logger.info(f'test rotation on server on disk')
+    server_rotation_setting = {
+        'rotation': 3,
+        'min_rotation_size': 65,
+        'max_rotation_size': 6400,
+        'prefix': './data/server_rotation',
+        'medium': 'disk',
+    }
+    dataloader = AsyncDataLoader(
+        dataset_class=Dataset,
+        dataset_params={'train': True},
+        batch_size=64,
+        nb_servers=1,
+        start_port=50000,
+        max_queue_size=10,
+        nearby_shuffle=100,
+        server_rotation_setting=server_rotation_setting,
+    )
+
+    start = time.time()
+    for _ in range(6):
+        for samples in tqdm(dataloader):
+            pass
+
+    stop = time.time()
+    dataloader.close()
+    logger.info('complete testing rotation on client on disk')
+
+
+
 
 if __name__ == '__main__':
     #---------------------------------------
-    #test_cache_server(False)
-    #test_cache_client(False)
-    test_rotation_on_memory(False)
-    test_rotation_on_disk(False)
+    #test_cache_server()
+    #test_cache_client()
+    #test_rotation_on_client_on_memory()
+    #test_rotation_on_client_on_disk()
+    #test_rotation_on_server_on_memory()
+    test_rotation_on_server_on_disk()
+    #test_rotation_on_disk(False)

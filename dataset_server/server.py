@@ -843,6 +843,7 @@ class DataloaderServer(TaskThread):
                 self.rotation.read_sample_idx = 0
                 # change to index of the queue to read from
                 async with self.locks.queue_index_changed:
+                    logger.warning(f'changing read queue index from {self.rotation.read_queue_idx} to ?')
                     self.rotation.read_queue_idx = 1 - self.rotation.read_queue_idx
                     # if there are samples in current_minibatch, we need to
                     # batch them too. Note that we dont want to wait until this
@@ -892,7 +893,7 @@ class DataloaderServer(TaskThread):
                     if counter < self.rotation.max_rotation:
                         # if not reaching the maximum rotation
                         # put back into the queue
-                        self.rotation.queue[self.read_queue_idx].put((counter + 1, sample), block=False)
+                        self.rotation.queue[self.rotation.read_queue_idx].put((counter + 1, sample), block=False)
 
                 except queue.Empty:
                     # if fails to read from the queue, wait a bit then try
@@ -971,7 +972,7 @@ class DataloaderServer(TaskThread):
                     if self.rotation.sample_idx == self.rotation.total_sample:
                         # reset the sample index counter and epoch counter
                         self.rotation.sample_idx = 0
-                        self.ratotion.epoch_idx += 1
+                        self.rotation.epoch_idx += 1
 
                         # we need to put None into the queue to signify the end
                         # of epoch
@@ -1107,7 +1108,7 @@ class DataloaderServer(TaskThread):
                 else:
                     # if we could read from record instead of from dataset
                     sample_idx = self.indices[self.rotation.write_sample_idx]
-                    sample = self.record.read_index(sample_idx)
+                    sample = self.cache.record.read_index(sample_idx)
                     self.rotation.queue[self.rotation.write_queue_idx].put((1, sample))
 
                     self.rotation.write_sample_idx += 1
@@ -1118,10 +1119,13 @@ class DataloaderServer(TaskThread):
 
             elif is_full:
                 # data queue is full, sleep a bit
+                logger.warning(f'rotation.queue: write queue is full')
                 await asyncio.sleep(0.001)
 
             elif not self.rotation.write_allowed:
+                #logger.warning('writing to queue is not allowed')
                 # check again if writing is now allowed
+                await asyncio.sleep(0.001)
                 async with self.locks.queue_index_changed:
                     self.rotation.write_allowed = (
                         self.rotation.write_queue_idx != self.rotation.read_queue_idx or
@@ -1151,6 +1155,7 @@ class DataloaderServer(TaskThread):
 
             async with self.locks.queue_index_changed:
                 # change the index of queue to write
+                logger.warning(f'changing write queue index from: {self.rotation.write_queue_idx}')
                 self.rotation.write_queue_idx = int(1 - self.rotation.write_queue_idx)
                 # if read and write index are the same but read and write epoch are different
                 # then it means we need to stop writing temporarily
@@ -1172,8 +1177,12 @@ class DataloaderServer(TaskThread):
 
     @verbose
     async def warn_and_exit(self, function_name, warning):
-        if self.record is not None:
-            self.record.close()
+        if self.cache is not None:
+            self.cache.record.close()
+        if self.rotation.medium == 'disk':
+            self.rotation.records[0].close()
+            self.rotation.records[1].close()
+
         await super().warn_and_exit(function_name, warning)
 
 
@@ -1247,20 +1256,20 @@ class DataloaderServer(TaskThread):
                 self.rotation.max_size = max(1, self.max_queue_size) * self.batch_size
                 self.rotation.medium = None
             else:
-                self.rotation.medium = rotation_setting['rotation_medium']
+                self.rotation.medium = rotation_setting['medium']
                 self.rotation.max_rotation = rotation_setting['rotation']
                 self.rotation.min_size = rotation_setting['min_rotation_size']
                 self.rotation.max_size = rotation_setting['max_rotation_size']
                 if self.rotation.medium == 'disk':
-                    self.rotation.prefix = rotation_setting['rotation_file_prefix']
+                    self.rotation.prefix = rotation_setting['prefix']
                     part_a = BinaryBlob(
-                        self.rotation.prefix + f'_{self.server_idx}_A.bin',
-                        self.rotation.prefix + f'_{self.server_idx}_A.idx',
+                        self.rotation.prefix + f'_{self.server_index}_A.bin',
+                        self.rotation.prefix + f'_{self.server_index}_A.idx',
                         mode='w',
                     )
                     part_b = BinaryBlob(
-                        self.rotation.prefix + f'_{self.server_idx}_B.bin',
-                        self.rotation.prefix + f'_{self.server_idx}_B.idx',
+                        self.rotation.prefix + f'_{self.server_index}_B.bin',
+                        self.rotation.prefix + f'_{self.server_index}_B.idx',
                         mode='w',
                     )
                     self.rotation.records = [part_a, part_b]
@@ -1280,7 +1289,7 @@ class DataloaderServer(TaskThread):
             self.total_sample = stop_idx - start_idx
             self.indices = shuffle_indices(start_idx, stop_idx, self.nearby_shuffle)
 
-            nb_mini_batch = int(np.ceil(self.total_sample / self.batch_size))
+            nb_mini_batch = int(np.ceil(self.total_sample * self.rotation.max_rotation / self.batch_size))
             self.dataset_length.put(nb_mini_batch)
 
             while not self.server_started:
@@ -1393,8 +1402,8 @@ class DataloaderServer(TaskThread):
         self.tasks.generate_sample_with_rotation = await delete(
             self.tasks.generate_sample_with_rotation
         )
-        self.tasks.generate_minibatch_without_rotation = await delete(
-            self.tasks.generate_minibatch_without_rotation
+        self.tasks.generate_sample_without_rotation = await delete(
+            self.tasks.generate_sample_without_rotation
         )
         self.tasks.generate_minibatch = await delete(
             self.tasks.generate_minibatch

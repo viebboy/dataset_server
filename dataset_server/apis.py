@@ -109,200 +109,178 @@ def fetch_data(
     clients,
     data_queue,
     rotation_queue,
-    max_rotation_size,
     max_queue_size,
     close_event,
     pin_memory,
-    cache_setting,
-    rotation_setting,
+    cache,
+    rotation,
     nearby_shuffle,
 ):
     # get the sample from the 1st client in the client list
     nb_client = len(clients)
-    indices = list(range(nb_client))
+    client_indices = list(range(nb_client))
     record = None
     current_epoch = 0
     minibatch_count = 0
     total_minibatch = sum([len(client) for client in clients])
 
     # rotation counter
-    rot_read_indices = None
-    rot_counter = 0
-    rot_write_idx = 0
-    queued_indices = []
+    rotation.read_indices = None
+    rotation.current_round = 0
+    rotation.write_idx = 0
+    rotation.ignored_indices = []
 
     # handle cache setting
-    if cache_setting is not None and cache_setting['cache_side'] == 'client':
+    if cache is not None and cache.side == 'client':
         # need caching
-        cache_binary_file = cache_setting['cache_prefix'] + '.bin'
-        cache_index_file = cache_setting['cache_prefix'] + '.idx'
-        if os.path.exists(cache_index_file) and os.path.exists(cache_binary_file):
-            # if rewrite, we delete the files
-            if cache_setting['rewrite']:
-                os.remove(cache_index_file)
-                os.remove(cache_binary_file)
-                record = BinaryBlob(cache_binary_file, cache_index_file, mode='w')
-            else:
-                record = BinaryBlob(cache_binary_file, cache_index_file, mode='r')
-        else:
-            record = BinaryBlob(cache_binary_file, cache_index_file, mode='w')
-
-        cache_update_frequency = cache_setting['update_frequency']
+        cache_binary_file = cache.prefix + '.bin'
+        cache_index_file = cache.prefix + '.idx'
+        cache.record = BinaryBlob(cache_binary_file, cache_index_file, mode='w')
+    else:
+        cache = None
 
     # handle rotation setting
-    if rotation_setting is not None:
-        rotation_medium = rotation_setting['rotation_medium']
-        if rotation_medium == 'disk':
-            part_a = BinaryBlob(
-                binary_file=rotation_setting['rotation_file_prefix'] + 'A.bin',
-                index_file=rotation_setting['rotation_file_prefix'] + 'A.idx',
-                mode='w',
-            )
-            part_b = BinaryBlob(
-                binary_file=rotation_setting['rotation_file_prefix'] + 'B.bin',
-                index_file=rotation_setting['rotation_file_prefix'] + 'B.idx',
-                mode='w',
-            )
-            rotation_records = [part_a, part_b]
-        else:
-            rotation_records = None
-        rotation = rotation_setting['rotation']
-
+    if rotation.medium == 'disk':
+        part_a = BinaryBlob(
+            binary_file=rotation.prefix + 'A.bin',
+            index_file=rotation.prefix + 'A.idx',
+            mode='w',
+        )
+        part_b = BinaryBlob(
+            binary_file=rotation.prefix + 'B.bin',
+            index_file=rotation.prefix + 'B.idx',
+            mode='w',
+        )
+        rotation.records = [part_a, part_b]
+    else:
+        rotation.records = None
 
     while True:
         if close_event.is_set():
             logger.info(f'receive signal to close data fetcher thread, closing now...')
-            if record is not None:
-                record.close()
+            if cache is not None:
+                cache.record.close()
             return
 
         # -------------------- Rotation Handling ----------------------------
-        if rotation_setting is None:
+        if rotation.medium == 'memory':
             # if rotate on memory, we simply move samples from data_queue to
             # rotation_queue until reaching the max size
             r_size = rotation_queue.qsize()
-            if r_size <= max_rotation_size:
-                for _ in range(max_rotation_size + 1 - r_size):
+            if r_size <= rotation.max_size:
+                for _ in range(rotation.max_size + 1 - r_size):
                     if not data_queue.empty():
                         minibatch = data_queue.get()
                         rotation_queue.put((1, minibatch))
                     else:
                         break
         else:
-            if rotation_medium == 'memory':
-                # rotate on memory
-                r_size = rotation_queue.qsize()
-                if r_size <= max_rotation_size:
-                    for _ in range(max_rotation_size + 1 - r_size):
-                        if not data_queue.empty():
-                            minibatch = data_queue.get()
-                            rotation_queue.put((1, minibatch))
+            # rotate on disk
+            # records[0] is always for reading (if mode is read)
+            # records[1] is always for writing (if mode is write)
+            # in disk rotation, we use max_queue_size as the threshold for
+            # rotation_queue
+            # max_rotation_size is used as the number of samples in a cache
+            # file
+            r_size = rotation_queue.qsize()
+            if r_size <= max_queue_size:
+                if rotation.records[0].mode() == 'read':
+                    # if there is rotation record for reading
+                    if len(rotation.read_indices) > 0:
+                        idx = rotation.read_indices.pop(0)
+                        minibatch = rotation.records[0].read_index(idx)
+                        # putting rot together with minibatch to
+                        # prevent __next__() in asyncloader putting
+                        # this minibatch batch back
+                        # basically rotation is handled in this
+                        # function
+                        rotation_queue.put((rotation.max_rotation, minibatch))
+
+                    # if we run out of indices, we need to increase
+                    # rot_counter, which keeps track of how many rotations on
+                    # this record has been made
+                    if len(rotation.read_indices) == 0:
+                        rotation.current_round += 1
+                        if rotation.current_round >= rotation.max_rotation:
+                            # if exceeding the number of rotations
+                            # we dont read from this record anymore
+                            # put this record into write mode
+                            rotation.current_round = 0
+                            rotation.read_indices = None
+                            rotation.records[0].close()
+                            rotation.records[0] = BinaryBlob(
+                                binary_file=rotation.records[0].binary_file(),
+                                index_file=rotation.records[0].index_file(),
+                                mode='w',
+                            )
                         else:
-                            break
-            else:
-                # rotate on disk
-                # records[0] is always for reading (if mode is read)
-                # records[1] is always for writing (if mode is write)
-                # in disk rotation, we use max_queue_size as the threshold for
-                # rotation_queue
-                # max_rotation_size is used as the number of samples in a cache
-                # file
-                r_size = rotation_queue.qsize()
-                if r_size <= max_queue_size:
-                    if rotation_records[0].mode() == 'read':
-                        # if there is rotation record for reading
-                        if len(rot_read_indices) > 0:
-                            idx = rot_read_indices.pop(0)
-                            minibatch = rotation_records[0].read_index(idx)
-                            # putting rot together with minibatch to
-                            # prevent __next__() in asyncloader putting
-                            # this minibatch batch
-                            # basically rotation is handled in this
-                            # function
-                            rotation_queue.put((rotation, minibatch))
-
-                        # if we run out of indices, we need to increase
-                        # rot_counter, which keeps track of how many rotations on
-                        # this record has been made
-                        if len(rot_read_indices) == 0:
-                            rot_counter += 1
-                            if rot_counter >= rotation:
-                                # if exceeding the number of rotations
-                                # we dont read from this record anymore
-                                # put this record into write mode
-                                rot_read_indices = None
-                                rotation_records[0].close()
-                                rotation_records[0] = BinaryBlob(
-                                    binary_file=rotation_records[0].binary_file(),
-                                    index_file=rotation_records[0].index_file(),
-                                    mode='w',
-                                )
-                            else:
-                                # if not exceeding the rotation limit
-                                # recreate a list of indices again
-                                rot_read_indices = shuffle_indices(
-                                    start_idx=0,
-                                    stop_idx=len(rotation_records[0]),
-                                    nearby_shuffle=nearby_shuffle,
-                                )
-
-                    if rotation_records[1].mode() == 'write':
-                        # if 2nd record is in write mode, we need get from
-                        # data_queue and write to records
-                        if not data_queue.empty():
-                            minibatch = data_queue.get()
-                            rotation_records[1].write_index(rot_write_idx, minibatch)
-                            # if 1st record in write mode, we need to also put
-                            # this minibatch into the rotation queue
-                            if rotation_records[0].mode() == 'write':
-                                # queued_indices keep track of which samples
-                                # have been sent to the rotation queue
-                                queued_indices.append(rot_write_idx)
-                                rotation_queue.put((rotation, minibatch))
-
-                            rot_write_idx += 1
-
-                        # check if we reach max_rotation_size
-                        # then we need to close this record
-                        if rot_write_idx == max_rotation_size:
-                            rot_write_idx = 0
-                            rotation_records[1].close()
-                            # then open again in read mode
-                            rotation_records[1] = BinaryBlob(
-                                binary_file=rotation_records[1].binary_file(),
-                                index_file=rotation_records[1].index_file(),
-                                mode='r',
+                            # if not exceeding the rotation limit
+                            # recreate a list of indices again
+                            rotation.read_indices = shuffle_indices(
+                                start_idx=0,
+                                stop_idx=len(rotation.records[0]),
+                                nearby_shuffle=nearby_shuffle,
                             )
 
-                    if rotation_records[0].mode() == 'write' and rotation_records[1].mode() == 'read':
-                        # swap position
-                        rotation_records = rotation_records[::-1]
-                        # then create a list of indices for future readout
-                        rot_read_indices = shuffle_indices(
-                            start_idx=0,
-                            stop_idx=len(rotation_records[0]),
-                            nearby_shuffle=nearby_shuffle,
+                if rotation.records[1].mode() == 'write':
+                    # if 2nd record is in write mode, we need get from
+                    # data_queue and write to records
+                    if not data_queue.empty():
+                        minibatch = data_queue.get()
+                        rotation.records[1].write_index(rotation.write_idx, minibatch)
+                        # if 1st record in write mode, we need to also put
+                        # this minibatch into the rotation queue
+                        if rotation.records[0].mode() == 'write':
+                            # queued_indices keep track of which samples
+                            # have been sent to the rotation queue
+                            rotation.ignored_indices.append(rotation.write_idx)
+                            rotation_queue.put((rotation.max_rotation, minibatch))
+
+                        rotation.write_idx += 1
+
+                    # check if we reach max_rotation_size
+                    # then we need to close this record
+                    if rotation.write_idx == rotation.max_size:
+                        rotation.write_idx = 0
+                        rotation.records[1].close()
+                        # then open again in read mode
+                        rotation.records[1] = BinaryBlob(
+                            binary_file=rotation.records[1].binary_file(),
+                            index_file=rotation.records[1].index_file(),
+                            mode='r',
                         )
-                        # remove those that are already in the rotation queue
-                        rot_read_indices = [i for i in rot_read_indices if i not in queued_indices]
-                        # reset queued_indices
-                        queued_indices = []
+
+                if rotation.records[0].mode() == 'write' and rotation.records[1].mode() == 'read':
+                    # swap position
+                    rotation.records = rotation.records[::-1]
+                    # then create a list of indices for future readout
+                    rotation.read_indices = shuffle_indices(
+                        start_idx=0,
+                        stop_idx=len(rotation.records[0]),
+                        nearby_shuffle=nearby_shuffle,
+                    )
+                    # remove those that are already in the rotation queue
+                    rotation.read_indices = [
+                        i for i in rotation.read_indices if i not in rotation.ignored_indices
+                    ]
+                    # reset queued_indices
+                    rotation.ignored_indices = []
 
 
         # --------------------- Data Handling From Server --------------------
         # --------------------- This includes caching on client side ---------
-        if record is None:
+        if cache is None:
             from_server = True
         else:
             if current_epoch == 0:
                 # 1st epoch, if record in read mode
                 # it means cache exists, just need to read from cache
-                if record.mode() == 'read':
+                if cache.record.mode() == 'read':
                     from_server = False
                 else:
                     from_server = True
             else:
-                if current_epoch % cache_update_frequency == 0:
+                if current_epoch % cache.update_frequency == 0:
                     from_server = True
                 else:
                     from_server = False
@@ -315,19 +293,19 @@ def fetch_data(
                     # check if 1st sample from the server and record in
                     # read mode, then we need to close the record and open
                     # again in write mode
-                    if minibatch_count == 0 and record is not None and record.mode() == 'read':
+                    if minibatch_count == 0 and cache is not None and cache.record.mode() == 'read':
                         # close
-                        record.close()
+                        cache.record.close()
                         # then open again for writing
-                        record = BinaryBlob(
-                            cache_binary_file,
-                            cache_index_file,
+                        cache.record = BinaryBlob(
+                            cache.record.binary_file(),
+                            cache.record.index_file(),
                             mode='w',
                         )
 
-                    leftover, minibatch = clients[indices[0]].get()
-                    if record is not None:
-                        record.write_index(minibatch_count, minibatch)
+                    leftover, minibatch = clients[client_indices[0]].get()
+                    if cache is not None:
+                        cache.record.write_index(minibatch_count, minibatch)
 
                     if pin_memory:
                         minibatch = pin_data_memory(minibatch)
@@ -337,29 +315,29 @@ def fetch_data(
 
                     if leftover == 0:
                         # remove the client from the list
-                        indices.pop(0)
-                        if len(indices) == 0:
+                        client_indices.pop(0)
+                        if len(client_indices) == 0:
                             # if empty, reinitialize
-                            indices = list(range(nb_client))
+                            client_indices = list(range(nb_client))
                             # then reset the counter
                             minibatch_count = 0
                             current_epoch += 1
-                            if record is not None:
+                            if cache is not None:
                                 # if record is not None, we also need to close
                                 # the record to finish the writing process
-                                record.close()
+                                cache.record.close()
                                 # then open record again in read mode
-                                record = BinaryBlob(
-                                    cache_binary_file,
-                                    cache_index_file,
+                                cache.record = BinaryBlob(
+                                    cache.record.binary_file(),
+                                    cache.record.index_file(),
                                     mode='r',
                                 )
                     else:
                         # rotate the list
-                        indices.append(indices.pop(0))
+                        client_indices.append(client_indices.pop(0))
                 else:
                     # if reading from cache file
-                    minibatch = record.read_index(minibatch_count)
+                    minibatch = cache.record.read_index(minibatch_count)
 
                     if pin_memory:
                         minibatch = pin_data_memory(minibatch)
@@ -382,62 +360,6 @@ def fetch_data(
                 raise RuntimeError(str(e))
         else:
             time.sleep(0.001)
-
-
-class CloseEvent:
-    def __init__(self, event_queue):
-        self.event_queue = event_queue
-
-    def is_set(self):
-        return not self.event_queue.empty()
-
-try:
-    from PySide6.QtCore import QObject, QThread
-
-    class DataFetcher(QObject):
-        def __init__(
-            self,
-            clients,
-            data_queue,
-            rotation_queue,
-            max_rotation_size,
-            max_queue_size,
-            pin_memory,
-            cache_setting,
-            rotation_setting,
-            nearby_shuffle,
-        ):
-            super().__init__()
-            self.clients = clients
-            self.data_queue = data_queue
-            self.rotation_queue = rotation_queue
-            self.max_rotation_size = max_rotation_size
-            self.max_queue_size = max_queue_size
-            self.pin_memory = pin_memory
-            self.close_signal = Queue()
-            self.cache_setting = cache_setting
-            self.rotation_setting = rotation_setting
-            self.nearby_shuffle = nearby_shuffle
-
-        def run(self):
-            # get the sample from the 1st client in the client list
-            fetch_data(
-                clients=self.clients,
-                data_queue=self.data_queue,
-                rotation_queue=self.rotation_queue,
-                max_rotation_size=self.max_rotation_size,
-                max_queue_size=self.max_queue_size,
-                close_event=CloseEvent(self.close_signal),
-                pin_memory=self.pin_memory,
-                cache_setting=self.cache_setting,
-                rotation_setting=self.rotation_setting,
-                nearby_shuffle=self.nearby_shuffle,
-            )
-
-
-except ImportError:
-    DataFetcher = None
-    DataRotator = None
 
 
 class DatasetClient:
@@ -584,12 +506,12 @@ class AsyncDataLoader:
             assert len(gpu_indices) == nb_servers
 
         # check the cache setting
-        self.check_cache_setting()
+        self.check_cache_setting(cache_setting)
 
         # assign batch size then check rotation setting
         self.batch_size = batch_size
-        self.rotation = self.check_rotation_setting(client_rotation_setting, 'client')
-        self.check_rotation_setting(server_rotation_setting, 'server')
+        self.rotation = self.check_rotation_setting(client_rotation_setting, 'client', max_queue_size)
+        self.check_rotation_setting(server_rotation_setting, 'server', max_queue_size)
 
 
         # start the servers
@@ -625,43 +547,23 @@ class AsyncDataLoader:
         self.rotation_queue = Queue()
         self.device = device
 
-        if not self.qt_threading:
-            # use python threading
-            self.fetcher_close_event = threading.Event()
-            self.data_thread = threading.Thread(
-                target=fetch_data,
-                args=(
-                    self.clients,
-                    self.data_queue,
-                    self.rotation_queue,
-                    self.max_rotation_size,
-                    max_queue_size,
-                    self.fetcher_close_event,
-                    pin_memory,
-                    cache_setting,
-                    rotation_setting,
-                    nearby_shuffle,
-                )
+        # use python threading
+        self.fetcher_close_event = threading.Event()
+        self.data_thread = threading.Thread(
+            target=fetch_data,
+            args=(
+                self.clients,
+                self.data_queue,
+                self.rotation_queue,
+                max_queue_size,
+                self.fetcher_close_event,
+                pin_memory,
+                self.cache,
+                self.rotation,
+                nearby_shuffle,
             )
-            self.data_thread.start()
-        else:
-            # use qt threading
-            self.data_thread = QThread()
-            self.data_fetcher = DataFetcher(
-                clients=self.clients,
-                data_queue=self.data_queue,
-                rotation_queue=self.rotation_queue,
-                max_rotation_size=self.max_rotation_size,
-                max_queue_size=max_queue_size,
-                pin_memory=pin_memory,
-                cache_setting=cache_setting,
-                rotation_setting=rotation_setting,
-                nearby_shuffle=nearby_shuffle,
-            )
-            self.data_fetcher.moveToThread(self.data_thread)
-            self.data_thread.started.connect(self.data_fetcher.run)
-            self.data_thread.start()
-
+        )
+        self.data_thread.start()
         # wait a bit to generate some samples before returning
         logger.info(f'waiting {wait_time} seconds to preload some samples')
         time.sleep(wait_time)
@@ -693,7 +595,7 @@ class AsyncDataLoader:
                 self.cache.update_frequency = cache_setting['update_frequency']
 
 
-    def check_rotation_setting(self, rotation_setting, side):
+    def check_rotation_setting(self, rotation_setting, side, max_queue_size):
         rotation = Property()
         if rotation_setting is None:
             rotation.max_rotation = 1
@@ -778,7 +680,7 @@ class AsyncDataLoader:
                 )
                 raise RuntimeError(''.join(msg))
 
-    return rotation
+        return rotation
 
 
     def wait_for_servers(self):
@@ -835,12 +737,8 @@ class AsyncDataLoader:
             logger.info('closing the AsyncDataLoader instance')
             # close the thread running DatasetClient
             if self.is_client_available:
-                if not self.qt_threading:
-                    self.fetcher_close_event.set()
-                    self.data_thread.join()
-                else:
-                    self.data_fetcher.close_signal.put(None)
-                    self.data_thread.quit()
+                self.fetcher_close_event.set()
+                self.data_thread.join()
 
                 for client in self.clients:
                     client.close()
@@ -952,20 +850,20 @@ class AsyncDataLoader:
 
 
     def __len__(self):
-        return max(1, self.rotation) * self.total_minibatch
+        return max(1, self.rotation.max_rotation) * self.total_minibatch
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        if self.minibatch_count >= max(1, self.rotation) * self.total_minibatch:
+        if self.minibatch_count >= max(1, self.rotation.max_rotation) * self.total_minibatch:
             self.minibatch_count = 0
             raise StopIteration
 
         while True:
-            if self.rotation > 1:
+            if self.rotation.max_rotation > 1:
                 # rotation is enabled
-                if self.rotation_queue.qsize() >= self.min_rotation_size:
+                if self.rotation_queue.qsize() >= self.rotation.min_size:
                     # has some minimum elements
                     readout = self.rotation_queue.get()
                     if readout is None:
@@ -975,7 +873,7 @@ class AsyncDataLoader:
                         raise RuntimeError(error)
 
                     counter, minibatch = readout
-                    if counter < self.rotation:
+                    if counter < self.rotation.max_rotation:
                         self.rotation_queue.put((counter+1, minibatch))
                     break
                 else:
