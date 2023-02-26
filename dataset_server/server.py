@@ -483,11 +483,6 @@ class DataloaderServer(TaskThread):
         self.current_minibatch = [[]]
         self.batcher_created = False
 
-        self.record = None
-        self.cache_update_frequency = 0
-        self.cache_binary_file = None
-        self.cache_index_file = None
-
 
     @verbose
     async def enter__(self):
@@ -496,6 +491,11 @@ class DataloaderServer(TaskThread):
 
     @verbose
     async def start_batching(self):
+        """
+        this function takes out the samples in the current minibatch
+        and put them in self.sample_queue, which is monitored by another repetitive task
+        called generate_minibatch__
+        """
         try:
             # move the current minibatch into sample_queue for batching
             # start generate minibatch task
@@ -517,11 +517,29 @@ class DataloaderServer(TaskThread):
 
             # reset
             self.current_minibatch = [[]]
+
         except asyncio.CancelledError:
             self.print_warning('start_batching', 'got canceled')
         except Exception as e:
             await self.warn_and_exit(
                 'start_batching',
+                str(e)
+            )
+
+
+    @verbose
+    async def generate_minibatch__(self):
+        # batching the samples and send to children
+        try:
+            if not self.sample_queue.empty():
+                samples = self.sample_queue.get()
+                minibatch = concatenate_list(samples, self.device)
+                self.minibatch_queue.put(minibatch)
+        except asyncio.CancelledError:
+            self.print_warning('generate_minibatch__', 'got canceled')
+        except Exception as e:
+            await self.warn_and_exit(
+                'generate_minibatch__',
                 str(e)
             )
 
@@ -812,25 +830,14 @@ class DataloaderServer(TaskThread):
     @verbose
     async def rotate_data_on_memory__(self):
         """
-        this function is used when rotation on memory is specified
-        or no rotation is specified
-        """
-        """
-            self.rotation.queue = [Queue(), Queue()]
-            self.rotation.queue_max_size = max(1, 0.5 * (self.max_queue_size)) * self.batch_size
-            self.rotation.queue_counter = max(1, 0.5 * (self.max_queue_size)) * self.batch_size
-            self.rotation.read_queue_idx = 0
-            self.rotation.read_sample_idx = 0
-            self.rotation.read_epoch_idx = 0
-            self.rotation.write_queue_idx = 0
-            self.rotation.write_sample_idx = 0
-            self.rotation.write_epoch_idx = 0
-            self.rotation.total_write = self.total_sample
-            self.rotation.total_read = self.total_sample * self.rotation.count
-            self.rotation.write_allowed = True
+        this task performs data rotation on memory (applied when no rotation or rotation on memory)
+        basically this task will read samples from a read queue in self.rotation.queue
+        if a sample has been not been rotated enough, it will be put back to self.rotation.queue
         """
         try:
             # reset counter if needed
+            # read_sample_idx is a counter to keep track of how many samples
+            # have been processed in the current epoch
             if self.rotation.read_sample_idx == self.rotation.total_read:
                 # reaching the total sample, change the index now
                 self.rotation.read_sample_idx = 0
@@ -846,6 +853,8 @@ class DataloaderServer(TaskThread):
                         await self.start_batching()
 
             # check if whether the numbef of minibatches to be sent is too much
+            # mn_counter is a proxy counter to reduce the time we check
+            # minibatch_queue
             if self.rotation.mb_counter > 0:
                 is_full = False
                 self.rotation.mb_counter -= 1
@@ -856,14 +865,23 @@ class DataloaderServer(TaskThread):
                 else:
                     is_full = False
 
-            if not is_full and self.rotation.queue[self.rotation.read_queue_idx].qsize() >= self.rotation.min_size:
+            # check if the read_queue has minimum size to start reading
+            # this is because when we read a sample, we will put it back to the
+            # queue --> we want to read when queue has at least some samples to
+            # avoid rotating a sample K continuous times
+            # note: we dont need to use the lock because
+            # generate_sample_with_rotation only modifies write_queue_idx, not
+            # the read_queue_idx
+            can_read = self.rotation.queue[self.rotation.read_queue_idx].qsize() >= self.rotation.min_size
+
+            if not is_full and can_read:
                 # note that we dont enforce less than max size here because we
                 # still need to move samples from the queue to
                 # current_minibatch and start batching
                 # max_size is only enforced in generate_sample
                 # if there is data enough to read
                 try:
-                    # try to get sample
+                    # try to get sample without blocking
                     counter, sample = self.rotation.queue[self.rotation.read_queue_idx].get(block=False)
                     self.rotation.read_sample_idx += 1
                     self.current_minibatch[0].append(sample)
@@ -877,9 +895,11 @@ class DataloaderServer(TaskThread):
                         self.rotation.queue[self.read_queue_idx].put((counter + 1, sample), block=False)
 
                 except queue.Empty:
+                    # if fails to read from the queue, wait a bit then try
+                    # again later
                     await asyncio.sleep(0.001)
-                    pass
             else:
+                # if cannot read, we wait a bit before rescheduling
                 await asyncio.sleep(0.001)
 
             self.tasks.rotate_data_on_memory = await reSchedule(
@@ -1074,8 +1094,8 @@ class DataloaderServer(TaskThread):
                         if self.cache is not None:
                             self.cache.record.close()
                             self.cache.record = BinaryBlob(
-                                self.cache.bin_file,
-                                self.cache.idx_file,
+                                self.cache.record.binary_file(),
+                                self.cache.record.index_file(),
                                 mode='r',
                             )
 
@@ -1108,6 +1128,7 @@ class DataloaderServer(TaskThread):
                         self.rotation.read_epoch_idx == self.rotation.write_epoch_idx
                     )
 
+            # reschedule this task
             self.tasks.generate_sample_with_rotation = await reSchedule(
                 self.generate_sample_with_rotation__
             )
@@ -1133,6 +1154,8 @@ class DataloaderServer(TaskThread):
                 self.rotation.write_queue_idx = int(1 - self.rotation.write_queue_idx)
                 # if read and write index are the same but read and write epoch are different
                 # then it means we need to stop writing temporarily
+                # this part that accesses read_queue_idx is the one that
+                # requires the lock
                 self.rotation.write_allowed = not (
                     self.rotation.write_queue_idx == self.rotation.read_queue_idx and
                     self.rotation.read_epoch_idx != self.rotation.write_epoch_idx
@@ -1199,21 +1222,12 @@ class DataloaderServer(TaskThread):
             self.dataset = constructor(**params)
 
             # handle caching
-            if cache_setting is not None and cache_setting['cache_side'] == 'server':
+            if cache_setting is not None and cache_setting['side'] == 'server':
                 self.cache = Property()
-                self.cache.bin_file = cache_setting['cache_prefix'] + '{:09d}.bin'.format(self.server_index)
-                self.cache.idx_file = cache_setting['cache_prefix'] + '{:09d}.idx'.format(self.server_index)
-                # if files exist
-                if os.path.exists(self.cache.bin_file) and os.path.exists(self.cache.idx_file):
-                    # if rewrite, we delete the files
-                    if cache_setting['rewrite']:
-                        os.remove(self.cache.bin_file)
-                        os.remove(self.cache.idx_file)
-                        self.cache.record = BinaryBlob(self.cache.bin_file, self.cache.idx_file, mode='w')
-                    else:
-                        self.cache.record = BinaryBlob(self.cache.bin_file, self.cache.idx_file, mode='r')
-                else:
-                    self.cache.record = BinaryBlob(self.cache.bin_file, self.cache.idx_file, mode='w')
+                self.cache.bin_file = cache_setting['prefix'] + '{:09d}.bin'.format(self.server_index)
+                self.cache.idx_file = cache_setting['prefix'] + '{:09d}.idx'.format(self.server_index)
+                self.cache.record = BinaryBlob(self.cache.bin_file, self.cache.idx_file, mode='w')
+
                 # if update frequency = K --> the cache files are rewritten
                 # every K epochs
                 self.cache.update_freq = cache_setting['update_frequency']
@@ -1359,6 +1373,12 @@ class DataloaderServer(TaskThread):
                     self.tasks.rotate_data_on_disk,
                     self.rotate_data_on_disk__
                 )
+
+            # start to generate minibatches
+            self.tasks.generate_minibatch = await reCreate(
+                self.tasks.generate_minibatch,
+                self.generate_minibatch__
+            )
 
         except asyncio.CancelledError:
             self.print_warning('load_dataset__', 'got canceled')

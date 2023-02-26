@@ -30,7 +30,7 @@ from queue import Queue
 import threading
 from loguru import logger
 import inspect
-from dataset_server.common import BinaryBlob, shuffle_indices
+from dataset_server.common import BinaryBlob, shuffle_indices, Property
 
 # size of the header
 INTERCOM_HEADER_LEN = 4
@@ -568,10 +568,10 @@ class AsyncDataLoader:
         client_wait_time=10,
         nb_retry=10,
         gpu_indices=None,
-        qt_threading=False,
         nearby_shuffle: int=0,
         cache_setting=None,
-        rotation_setting=None,
+        client_rotation_setting=None,
+        server_rotation_setting=None,
     ):
         try:
             dataset_tmp = dataset_class(**dataset_params)
@@ -583,56 +583,14 @@ class AsyncDataLoader:
         if gpu_indices is not None:
             assert len(gpu_indices) == nb_servers
 
-        if cache_setting is not None:
-            # cache side must be server or client
-            assert 'cache_side' in cache_setting
-            assert cache_setting['cache_side'] in ['server', 'client']
-            assert 'cache_prefix' in cache_setting
-            if not os.path.exists(os.path.dirname(cache_setting['cache_prefix'])):
-                prefix = cache_setting['cache_prefix']
-                raise RuntimeError('The directory of cache_prefix ({prefix}) does not exist')
-            assert 'rewrite' in cache_setting
-            assert 'update_frequency' in cache_setting
-            assert cache_setting['update_frequency'] >= 2
+        # check the cache setting
+        self.check_cache_setting()
 
-        if rotation_setting is None:
-            self.rotation = 1
-            self.min_rotation_size = 1
-            self.max_rotation_size = max_queue_size
-        else:
-            assert 'rotation' in rotation_setting
-            assert 'min_rotation_size' in rotation_setting
-            assert 'max_rotation_size' in rotation_setting
+        # assign batch size then check rotation setting
+        self.batch_size = batch_size
+        self.rotation = self.check_rotation_setting(client_rotation_setting, 'client')
+        self.check_rotation_setting(server_rotation_setting, 'server')
 
-            assert 'rotation_medium' in rotation_setting
-            assert rotation_setting['rotation_medium'] in ['memory', 'disk']
-
-            if rotation_setting['rotation_medium'] == 'disk':
-                assert 'rotation_file_prefix' in rotation_setting
-                if not os.path.exists(os.path.dirname(rotation_setting['rotation_file_prefix'])):
-                    prefix = cache_setting['rotation_file_prefix']
-                    raise RuntimeError('The directory of rotation_file_prefix ({prefix}) does not exist')
-
-            if (
-                rotation_setting['rotation_medium'] == 'disk' and\
-                cache_setting is not None and\
-                cache_setting['cache_side'] == 'client'
-            ):
-                logger.warning('Caching on client side and rotation on disk can lead to unncessary overhead')
-                logger.warning('Consider using memory as rotation medium and caching on client')
-                logger.warning('Or using disk as rotation medium and no caching (or caching on server side)')
-
-            assert rotation_setting['rotation'] >= 2
-            self.rotation = rotation_setting['rotation']
-            logger.warning(
-                f'rotation option is ON. This means the dataset will be replicate {self.rotation} times'
-            )
-            assert rotation_setting['min_rotation_size'] >= 2,\
-                'min_rotation_size must be at least 2'
-            self.min_rotation_size = rotation_setting['min_rotation_size']
-            assert rotation_setting['max_rotation_size'] >= 3,\
-                'max_rotation_size must be at least 3'
-            self.max_rotation_size = rotation_setting['max_rotation_size']
 
         # start the servers
         logger.info('starting services, this will take a while')
@@ -646,30 +604,14 @@ class AsyncDataLoader:
             shuffle=shuffle,
             packet_size=packet_size,
             gpu_indices=gpu_indices,
-            cache_setting=cache_setting,
             nearby_shuffle=nearby_shuffle,
+            cache_setting=cache_setting,
+            rotation_setting=server_rotation_setting,
         )
         self.wait_for_servers()
 
         self.is_closed = False
         self.is_client_available = False
-
-        if qt_threading:
-            msg = (
-                f'qt_threading option is True. To use threading from Qt framework, ',
-                'PySide6 needs to be installed'
-            )
-            logger.warning(''.join(msg))
-
-        if qt_threading:
-            if DataFetcher is not None:
-                self.qt_threading = True
-                logger.warning('found working installation of Pyside6, QThread is in used')
-            else:
-                logger.warning('cannot find working installation of Pyside6, use default python threading')
-                self.qt_threading = False
-        else:
-            self.qt_threading = False
 
         # start clients
         self.start_clients(packet_size, client_wait_time, nb_retry)
@@ -723,6 +665,121 @@ class AsyncDataLoader:
         # wait a bit to generate some samples before returning
         logger.info(f'waiting {wait_time} seconds to preload some samples')
         time.sleep(wait_time)
+
+    def check_cache_setting(self, cache_setting):
+        self.cache = None
+        if cache_setting is not None:
+            # cache side must be server or client
+            assert 'side' in cache_setting
+            assert cache_setting['side'] in ['server', 'client']
+            assert 'prefix' in cache_setting
+            if not os.path.exists(os.path.dirname(cache_setting['prefix'])):
+                prefix = cache_setting['prefix']
+                raise RuntimeError('The directory of cache_prefix ({prefix}) does not exist')
+            assert 'update_frequency' in cache_setting
+            if cache_setting['update_frequency'] < 2:
+                msg = (
+                    "there's no point in caching if update_frequency is less than 2; ",
+                    f"received update_frequency={update_frequency}"
+                )
+                raise RuntimeError(''.join(msg))
+
+            # now if caching on client side, create a property space to hold
+            # all of properties
+            if cache_setting['side'] == 'client':
+                self.cache = Property()
+                self.cache.side = cache_setting['side']
+                self.cache.prefix = cache_setting['prefix']
+                self.cache.update_frequency = cache_setting['update_frequency']
+
+
+    def check_rotation_setting(self, rotation_setting, side):
+        rotation = Property()
+        if rotation_setting is None:
+            rotation.max_rotation = 1
+            rotation.min_size = 1
+            rotation.max_size = max_queue_size
+            rotation.medium = 'memory'
+        else:
+            assert 'rotation' in rotation_setting
+            assert 'min_rotation_size' in rotation_setting
+            assert 'max_rotation_size' in rotation_setting
+            rotation.max_rotation = rotation_setting['rotation']
+            rotation.min_size = rotation_setting['min_rotation_size']
+            rotation.max_size = rotation_setting['max_rotation_size']
+
+            assert 'medium' in rotation_setting
+            assert rotation_setting['medium'] in ['memory', 'disk']
+            rotation.medium = rotation_setting['medium']
+
+            if rotation.medium == 'disk':
+                assert 'prefix' in rotation_setting
+                if not os.path.exists(os.path.dirname(rotation_setting['prefix'])):
+                    prefix = rotation_setting['prefix']
+                    raise RuntimeError('The directory of file_prefix ({prefix}) does not exist')
+                rotation.prefix = rotation_setting['prefix']
+
+            if side == 'client' and rotation.medium == 'disk' and self.cache is not None:
+                msg = (
+                    'Caching on client side and rotation on disk can lead to unncessary overhead; ',
+                    'Consider using memory as rotation medium and caching on client; ',
+                    'Or using disk as rotation medium and no caching (or caching on server side);'
+                )
+                raise RuntimeError(''.join(msg))
+
+            if rotation.max_rotation < 2:
+                msg = (
+                    'the number of rotations should be at least 2; ',
+                    f'received {rotation.max_rotation}'
+                )
+                raise RuntimeError(''.join(msg))
+
+            assert rotation.min_size >= 1,\
+                'min_rotation_size must be at least 1'
+
+            assert rotation.max_size >= 2,\
+                'max_rotation_size must be at least 2'
+
+            if rotation.max_size <= rotation.min_size:
+                msg = (
+                    'max_rotation_size must be larger than min_rotation_size; ',
+                    f'received max_rotation_size={rotation.max_size}, ',
+                    f'min_rotation_size={rotation.min_size}'
+                )
+                raise RuntimeError(''.join(msg))
+
+            invalid_min_size = (
+                rotation.max_rotation > 1 and
+                side == 'server' and
+                rotation.medium == 'memory' and
+                rotation.min_size <= self.batch_size
+            )
+            if invalid_min_size:
+                msg = (
+                    'when rotation on memory on server side is specified, ',
+                    f'min_rotation_size ({rotation.min_size}) must be larger ',
+                    f'than batch_size ({self.batch_size}); ',
+                    'this is to ensure that a sample is not repeated many times in the same minibatch',
+                )
+                raise RuntimeError(''.join(msg))
+
+            invalid_max_size = (
+                rotation.max_rotation > 1 and
+                side == 'server' and
+                rotation.medium == 'disk' and
+                rotation.max_size < self.batch_size
+            )
+            if invalid_max_size:
+                msg = (
+                    'when rotation on disk on server side is specified, ',
+                    f'max_rotation_size ({rotation.max_size}) must be at least ',
+                    f'batch_size ({self.batch_size}); ',
+                    'this is to ensure that enough samples are written to file for rotation',
+                )
+                raise RuntimeError(''.join(msg))
+
+    return rotation
+
 
     def wait_for_servers(self):
         logger.info('waiting for servers to load dataset...')
@@ -811,8 +868,9 @@ class AsyncDataLoader:
         shuffle: bool,
         packet_size: int,
         gpu_indices: list,
-        cache_setting: dict,
         nearby_shuffle: bool,
+        cache_setting: dict,
+        rotation_setting: dict,
     ):
         """
         start the dataset servers
@@ -834,6 +892,7 @@ class AsyncDataLoader:
                     'class_name': class_name,
                     'params': dataset_params,
                     'cache_setting': cache_setting,
+                    'rotation_setting': rotation_setting,
                 },
                 fid,
                 recurse=True
@@ -853,6 +912,7 @@ class AsyncDataLoader:
                 if isinstance(indices, int):
                     indices = [indices,]
                 env_var = ','.join([str(v) for v in indices])
+                #TODO: check the case when script is run with CUDA_VISIBLE_DEVICES
                 all_env_var['CUDA_VISIBLE_DEVICES'] = env_var
 
             process = subprocess.Popen(
