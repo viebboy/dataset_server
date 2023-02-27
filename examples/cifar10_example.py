@@ -70,7 +70,7 @@ def test_cache_server():
     cache_setting = {
         'side': 'server',
         'prefix': './data/train_cache',
-        'update_frequency': np.inf,
+        'update_frequency': 3,
     }
     dataloader = AsyncDataLoader(
         dataset_class=Dataset,
@@ -212,10 +212,10 @@ def test_rotation_on_server_on_disk():
 
 if __name__ == '__main__':
     #---------------------------------------
-    #test_cache_server()
+    test_cache_server()
     #test_cache_client()
     #test_rotation_on_client_on_memory()
     #test_rotation_on_client_on_disk()
     #test_rotation_on_server_on_memory()
-    test_rotation_on_server_on_disk()
+    #test_rotation_on_server_on_disk()
     #test_rotation_on_disk(False)

@@ -569,23 +569,7 @@ class DataloaderServer(TaskThread):
     @verbose
     async def cache_rotation__(self):
         """
-        this function writes data to self.rotation.records
-        and start batching
-
-        self.locks.check_record
-        self.locks.check_indices_to_ignore
-
-        self.rotation.disk.sample_counter = 0
-        self.rotation.disk.sample_write_idx = 0
-        self.rotation.disk.current_round = 0
-        self.rotation.disk.indices_to_read = []
-        self.rotation.disk.indices_to_ignore = []
-
-        IMPORTANT: we might want to continue writing as long as there's cache space
-        but we might not want to add samples to current_minibatch and batching because
-        the queue might be full so we NEED to check the size of minibatch_queue like
-        rotate_data_on_disk
-
+        this task is used to write rotation data to disk
         """
         try:
             async with self.locks.check_record:
@@ -843,7 +827,7 @@ class DataloaderServer(TaskThread):
                 self.rotation.read_sample_idx = 0
                 # change to index of the queue to read from
                 async with self.locks.queue_index_changed:
-                    logger.warning(f'changing read queue index from {self.rotation.read_queue_idx} to ?')
+                    #logger.warning(f'changing read queue index from {self.rotation.read_queue_idx} to ?')
                     self.rotation.read_queue_idx = 1 - self.rotation.read_queue_idx
                     # if there are samples in current_minibatch, we need to
                     # batch them too. Note that we dont want to wait until this
@@ -873,7 +857,10 @@ class DataloaderServer(TaskThread):
             # note: we dont need to use the lock because
             # generate_sample_with_rotation only modifies write_queue_idx, not
             # the read_queue_idx
-            can_read = self.rotation.queue[self.rotation.read_queue_idx].qsize() >= self.rotation.min_size
+            can_read = (
+                (self.rotation.queue[self.rotation.read_queue_idx].qsize() >= self.rotation.min_size) or
+                self.rotation.read_sample_idx > 0
+            )
 
             if not is_full and can_read:
                 # note that we dont enforce less than max size here because we
@@ -1119,7 +1106,7 @@ class DataloaderServer(TaskThread):
 
             elif is_full:
                 # data queue is full, sleep a bit
-                logger.warning(f'rotation.queue: write queue is full')
+                #logger.warning(f'rotation.queue: write queue is full')
                 await asyncio.sleep(0.001)
 
             elif not self.rotation.write_allowed:
@@ -1155,8 +1142,8 @@ class DataloaderServer(TaskThread):
 
             async with self.locks.queue_index_changed:
                 # change the index of queue to write
-                logger.warning(f'changing write queue index from: {self.rotation.write_queue_idx}')
-                self.rotation.write_queue_idx = int(1 - self.rotation.write_queue_idx)
+                #logger.warning(f'changing write queue index from: {self.rotation.write_queue_idx}')
+                self.rotation.write_queue_idx = 1 - self.rotation.write_queue_idx
                 # if read and write index are the same but read and write epoch are different
                 # then it means we need to stop writing temporarily
                 # this part that accesses read_queue_idx is the one that
