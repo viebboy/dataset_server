@@ -863,7 +863,7 @@ class AsyncDataLoader:
         while True:
             if self.rotation.max_rotation > 1:
                 # rotation is enabled
-                if self.rotation_queue.qsize() >= self.rotation.min_size:
+                if (self.rotation_queue.qsize() >= self.rotation.min_size or self.minibatch_count > 0):
                     # has some minimum elements
                     readout = self.rotation_queue.get()
                     if readout is None:
