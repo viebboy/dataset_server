@@ -743,10 +743,9 @@ class DataloaderServer(TaskThread):
 
                 # compute the maximum number of minibatches that we can
                 # generate based on max_queue_size
-                max_minibatch = max(1, self.max_queue_size - self.minibatch_queue.qsize())
-                minibatch_count = 0
                 # loop through the leftover indices and read from record
-                for _ in range(len(self.rotation.disk.indices_to_read)):
+                N = min(self.batch_size - len(self.current_minibatch[0]), len(self.rotation.disk.indices_to_read))
+                for _ in range(N):
                     idx = self.rotation.disk.indices_to_read.pop(0)
                     minibatch = self.rotation.records[0].read_index(idx)
 
@@ -758,10 +757,6 @@ class DataloaderServer(TaskThread):
                     # if there is enough sample to batch, then start batching
                     if len(self.current_minibatch[0]) == self.batch_size:
                         await self.start_batching()
-                        minibatch_count += 1
-
-                        if minibatch_count >= max_minibatch:
-                            break
 
                 # now check if indices_to_read is empty
                 # then increase the round counter
