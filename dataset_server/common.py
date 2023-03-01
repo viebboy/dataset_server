@@ -24,6 +24,31 @@ import numpy as np
 from tqdm import tqdm
 from loguru import logger
 import random
+from task_thread import (
+    reCreate,
+    reSchedule,
+    delete,
+    verbose,
+    signals
+)
+import copy
+from task_thread import TaskThread as BaseTaskThread
+
+
+# size of the header
+INTERCOM_HEADER_LEN = 4
+
+def object_to_bytes(dic):
+    """Turn dic into bytes & append the bytes with the bytes length
+    """
+    bytes_ = dill.dumps(dic)
+    le = len(bytes_)
+    bytes_ = le.to_bytes(INTERCOM_HEADER_LEN, "big") + bytes_
+    return bytes_
+
+def bytes_to_object(byte_arr):
+    obj = dill.loads(byte_arr)
+    return obj
 
 
 def shuffle_indices(start_idx, stop_idx, nearby_shuffle):
@@ -194,3 +219,35 @@ class Property:
     """
     def __init__(self):
         pass
+
+
+class TaskThread(BaseTaskThread):
+    """
+    A modified base TaskThread class that implements some functionalities
+    """
+
+    def __init__(self, name, parent=None):
+        super().__init__(parent=parent)
+        self.name = name
+        self.parent = parent
+
+    async def warn_and_exit(self, function_name, message=''):
+        logger.warning(
+            f'{self.getInfo()} {function_name}: face issue {message}'
+        )
+        logger.warning(
+            f'{self.getInfo()} {function_name}: exit now...'
+        )
+        await self.stop()
+
+    def getId(self):
+        return str(id(self))
+
+    def getInfo(self):
+        return f"<{self.name} {self.getId()}>"
+
+    def print_info(self, function_name, message):
+        logger.info(f'{self.getInfo()} {function_name}: {message}')
+
+    def print_warning(self, function_name, message):
+        logger.warning(f'{self.getInfo()} {function_name}: {message}')

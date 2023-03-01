@@ -30,57 +30,15 @@ from queue import Queue
 import threading
 from loguru import logger
 import inspect
-from dataset_server.common import BinaryBlob, shuffle_indices, Property
-
-# size of the header
-INTERCOM_HEADER_LEN = 4
-
-try:
-    import __builtin__ as B
-except ImportError:
-    import builtins as B
-
-BUILTIN_TYPES = []
-for t in B.__dict__.values():
-    if isinstance(t, type) and t is not object and t is not type:
-        BUILTIN_TYPES.append(t)
+import multiprocessing as MP
+from dataset_server.common import (
+    BinaryBlob,
+    shuffle_indices,
+    Property,
+)
 
 
-def is_builtin_type(obj):
-    output = False
-    for t in BUILTIN_TYPES:
-        if isinstance(obj, t):
-            output = True
-            break
-    return output
-
-
-def mainify(obj):
-    """
-    If obj is not defined in __main__ then redefine it in
-    main so that dill will serialize the definition along with the object
-    Taken from:
-    https://oegedijk.github.io/blog/pickle/dill/python/2020/11/10/serializing-dill-references.html
-
-    Modified so that mainify is only applied to custom Class
-    """
-
-    # if obj is a class and is not a builtin type
-    if inspect.isclass(obj) and not is_builtin_type(obj):
-        if obj.__module__ != "__main__":
-            import __main__
-            s = inspect.getsource(obj)
-            co = compile(s, '<string>', 'exec')
-            exec(co, __main__.__dict__)
-            logger.debug(f'mainifying class : {obj}')
-        else:
-            logger.debug(f'get a class : {obj} but scope is in main')
-    elif isinstance(obj, (tuple, list)):
-        for item in obj:
-            mainify(item)
-    elif isinstance(obj, dict):
-        for _, value in obj.items():
-            mainify(value)
+CTX = MP.get_context('spawn')
 
 
 def get_random_file(length):
@@ -105,372 +63,36 @@ def pin_data_memory(x):
         return x.pin_memory()
 
 
-def fetch_data(
-    clients,
-    data_queue,
-    rotation_queue,
-    max_queue_size,
-    close_event,
-    pin_memory,
-    cache,
-    rotation,
-    nearby_shuffle,
-):
-    # get the sample from the 1st client in the client list
-    nb_client = len(clients)
-    client_indices = list(range(nb_client))
-    record = None
-    current_epoch = 0
-    minibatch_count = 0
-    total_minibatch = sum([len(client) for client in clients])
+class ClientProcess(CTX.Process):
+    """
+    client process that handles 1 connection to 1 server
+    """
+    def __init__(self, data_queue, event_queue, **kwargs):
+        super().__init__()
+        self.verify_arguments(kwargs)
+        self.kwargs = kwargs
+        self.data_queue = data_queue
+        self.event_queue = event_queue
 
-    # rotation counter
-    rotation.read_indices = None
-    rotation.current_round = 0
-    rotation.write_idx = 0
-    rotation.ignored_indices = []
+    def verify_arguments(self, kwargs):
+        keys = [
+            'client_index',
+            'port',
+            'max_queue_size',
+            'packet_size',
+            'retry_interval',
+            'nb_retry',
+            'cache',
+        ]
+        for key in keys:
+            assert key in kwargs
 
-    # handle cache setting
-    if cache is not None and cache.side == 'client':
-        # need caching
-        cache_binary_file = cache.prefix + '.bin'
-        cache_index_file = cache.prefix + '.idx'
-        cache.record = BinaryBlob(cache_binary_file, cache_index_file, mode='w')
-    else:
-        cache = None
-
-    # handle rotation setting
-    if rotation.medium == 'disk':
-        part_a = BinaryBlob(
-            binary_file=rotation.prefix + 'A.bin',
-            index_file=rotation.prefix + 'A.idx',
-            mode='w',
-        )
-        part_b = BinaryBlob(
-            binary_file=rotation.prefix + 'B.bin',
-            index_file=rotation.prefix + 'B.idx',
-            mode='w',
-        )
-        rotation.records = [part_a, part_b]
-    else:
-        rotation.records = None
-
-    while True:
-        if close_event.is_set():
-            logger.info(f'receive signal to close data fetcher thread, closing now...')
-            if cache is not None:
-                cache.record.close()
-            return
-
-        # -------------------- Rotation Handling ----------------------------
-        if rotation.medium == 'memory':
-            # if rotate on memory, we simply move samples from data_queue to
-            # rotation_queue until reaching the max size
-            r_size = rotation_queue.qsize()
-            if r_size <= rotation.max_size:
-                for _ in range(rotation.max_size + 1 - r_size):
-                    if not data_queue.empty():
-                        minibatch = data_queue.get()
-                        rotation_queue.put((1, minibatch))
-                    else:
-                        break
-        else:
-            # rotate on disk
-            # records[0] is always for reading (if mode is read)
-            # records[1] is always for writing (if mode is write)
-            # in disk rotation, we use max_queue_size as the threshold for
-            # rotation_queue
-            # max_rotation_size is used as the number of samples in a cache
-            # file
-            r_size = rotation_queue.qsize()
-            if r_size <= max_queue_size:
-                if rotation.records[0].mode() == 'read':
-                    # if there is rotation record for reading
-                    if len(rotation.read_indices) > 0:
-                        idx = rotation.read_indices.pop(0)
-                        minibatch = rotation.records[0].read_index(idx)
-                        # putting rot together with minibatch to
-                        # prevent __next__() in asyncloader putting
-                        # this minibatch batch back
-                        # basically rotation is handled in this
-                        # function
-                        rotation_queue.put((rotation.max_rotation, minibatch))
-
-                    # if we run out of indices, we need to increase
-                    # rot_counter, which keeps track of how many rotations on
-                    # this record has been made
-                    if len(rotation.read_indices) == 0:
-                        rotation.current_round += 1
-                        if rotation.current_round >= rotation.max_rotation:
-                            # if exceeding the number of rotations
-                            # we dont read from this record anymore
-                            # put this record into write mode
-                            rotation.current_round = 0
-                            rotation.read_indices = None
-                            rotation.records[0].close()
-                            rotation.records[0] = BinaryBlob(
-                                binary_file=rotation.records[0].binary_file(),
-                                index_file=rotation.records[0].index_file(),
-                                mode='w',
-                            )
-                        else:
-                            # if not exceeding the rotation limit
-                            # recreate a list of indices again
-                            rotation.read_indices = shuffle_indices(
-                                start_idx=0,
-                                stop_idx=len(rotation.records[0]),
-                                nearby_shuffle=nearby_shuffle,
-                            )
-
-                if rotation.records[1].mode() == 'write':
-                    # if 2nd record is in write mode, we need get from
-                    # data_queue and write to records
-                    if not data_queue.empty():
-                        minibatch = data_queue.get()
-                        rotation.records[1].write_index(rotation.write_idx, minibatch)
-                        # if 1st record in write mode, we need to also put
-                        # this minibatch into the rotation queue
-                        if rotation.records[0].mode() == 'write':
-                            # queued_indices keep track of which samples
-                            # have been sent to the rotation queue
-                            rotation.ignored_indices.append(rotation.write_idx)
-                            rotation_queue.put((rotation.max_rotation, minibatch))
-
-                        rotation.write_idx += 1
-
-                    # check if we reach max_rotation_size
-                    # then we need to close this record
-                    if rotation.write_idx == rotation.max_size:
-                        rotation.write_idx = 0
-                        rotation.records[1].close()
-                        # then open again in read mode
-                        rotation.records[1] = BinaryBlob(
-                            binary_file=rotation.records[1].binary_file(),
-                            index_file=rotation.records[1].index_file(),
-                            mode='r',
-                        )
-
-                if rotation.records[0].mode() == 'write' and rotation.records[1].mode() == 'read':
-                    # swap position
-                    rotation.records = rotation.records[::-1]
-                    # then create a list of indices for future readout
-                    rotation.read_indices = shuffle_indices(
-                        start_idx=0,
-                        stop_idx=len(rotation.records[0]),
-                        nearby_shuffle=nearby_shuffle,
-                    )
-                    # remove those that are already in the rotation queue
-                    rotation.read_indices = [
-                        i for i in rotation.read_indices if i not in rotation.ignored_indices
-                    ]
-                    # reset queued_indices
-                    rotation.ignored_indices = []
-
-
-        # --------------------- Data Handling From Server --------------------
-        # --------------------- This includes caching on client side ---------
-        if cache is None:
-            from_server = True
-        else:
-            if current_epoch == 0:
-                # 1st epoch, if record in read mode
-                # it means cache exists, just need to read from cache
-                if cache.record.mode() == 'read':
-                    from_server = False
-                else:
-                    from_server = True
-            else:
-                if current_epoch % cache.update_frequency == 0:
-                    from_server = True
-                else:
-                    from_server = False
-
-
-        if data_queue.qsize() <= max_queue_size:
-            try:
-                if from_server:
-                    # if reading from server
-                    # check if 1st sample from the server and record in
-                    # read mode, then we need to close the record and open
-                    # again in write mode
-                    if minibatch_count == 0 and cache is not None and cache.record.mode() == 'read':
-                        # close
-                        cache.record.close()
-                        # then open again for writing
-                        cache.record = BinaryBlob(
-                            cache.record.binary_file(),
-                            cache.record.index_file(),
-                            mode='w',
-                        )
-
-                    leftover, minibatch = clients[client_indices[0]].get()
-                    if cache is not None:
-                        cache.record.write_index(minibatch_count, minibatch)
-
-                    if pin_memory:
-                        minibatch = pin_data_memory(minibatch)
-
-                    data_queue.put(minibatch)
-                    minibatch_count += 1
-
-                    if leftover == 0:
-                        # remove the client from the list
-                        client_indices.pop(0)
-                        if len(client_indices) == 0:
-                            # if empty, reinitialize
-                            client_indices = list(range(nb_client))
-                            # then reset the counter
-                            minibatch_count = 0
-                            current_epoch += 1
-                            if cache is not None:
-                                # if record is not None, we also need to close
-                                # the record to finish the writing process
-                                cache.record.close()
-                                # then open record again in read mode
-                                cache.record = BinaryBlob(
-                                    cache.record.binary_file(),
-                                    cache.record.index_file(),
-                                    mode='r',
-                                )
-                    else:
-                        # rotate the list
-                        client_indices.append(client_indices.pop(0))
-                else:
-                    # if reading from cache file
-                    minibatch = cache.record.read_index(minibatch_count)
-
-                    if pin_memory:
-                        minibatch = pin_data_memory(minibatch)
-
-                    data_queue.put(minibatch)
-                    minibatch_count += 1
-
-                    # reset counter
-                    if minibatch_count == total_minibatch:
-                        current_epoch += 1
-                        minibatch_count = 0
-
-            except RuntimeError as e:
-                # put None to data queue
-                # then put error message
-                data_queue.put(None)
-                data_queue.put(str(e))
-                for client in clients:
-                    client.close()
-                raise RuntimeError(str(e))
-        else:
-            time.sleep(0.001)
-
-
-class DatasetClient:
-    def __init__(self, index, port, packet_size: int, hostname='localhost', wait_time=10, nb_retry=10):
-        self.index = index
-        self.port = port
-        self.hostname = hostname
-        self.socket = None
-        self.wait_time = wait_time
-        self.nb_retry = nb_retry
-        self.size = None
-        self.packet_size = packet_size
-
-        # initialize connection
-        self.init_connection()
-
-        # counter to track minibatch
-        self.minibatch_count = 0
-
-    def __len__(self):
-        return self.size
-
-    def get(self):
-        try:
-            if self.minibatch_count == self.size:
-                self.minibatch_count = 0
-
-            samples = self.read_socket()
-            self.write_socket('ok')
-            self.minibatch_count += 1
-            return self.size - self.minibatch_count, samples
-
-        except Exception as e:
-            logger.warning('face the following exception')
-            logger.warning(str(e))
-            self.close()
-            raise RuntimeError(str(e))
-
-    def close(self):
-        if self.socket is not None:
-            logger.info(f'closing connection to {self.hostname} at port {self.port}')
-            self.socket.close()
-            self.socket = None
-
-    def init_connection(self):
-        if self.socket is None:
-            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            count = 0
-
-            # try to connect
-            success = False
-            while True:
-                try:
-                    self.socket.connect((self.hostname, self.port))
-                    logger.info(f'connected to server {self.hostname} at port {self.port}')
-                    success = True
-                    break
-                except Exception as e:
-                    time.sleep(self.wait_time)
-                    count += 1
-                    msg = (
-                        f'failed to connect at the {count}-th attempt! ',
-                        f'wating {self.wait_time} seconds before retrying'
-                    )
-                    logger.warning(''.join(msg))
-                    if count >= self.nb_retry:
-                        logger.warning(f'failed to connect after retrying {self.nb_retry} times')
-                        logger.warning('terminating now!!!')
-                        break
-
-            # disable naggle algorithm
-            #self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, True)
-
-            # now read the size of the dataset (number of minibatches)
-            # the size is sent as 4 bytes
-            if success:
-                self.size = int.from_bytes(self.socket.recv(4), 'big')
-                self.write_socket('ok')
-            else:
-                raise RuntimeError(f'failed to connect after retrying {self.nb_retry} times')
-
-    def read_socket(self):
-        """
-        first read header (4 bytes), which contains the size of the object
-        then read the object
-        """
-        # read the header
-        header = self.socket.recv(INTERCOM_HEADER_LEN)
-        # compute the object length
-        obj_len = int.from_bytes(header, 'big')
-        # then read the object length
-        nb_byte_left = obj_len
-        byte_rep = bytes()
-        while nb_byte_left > 0:
-            block_size = min(nb_byte_left, self.packet_size)
-            bytes_ = self.socket.recv(block_size)
-            if len(bytes_) < 1:
-                sys.exit(2)
-            byte_rep += bytes_
-            nb_byte_left -= len(bytes_)
-
-        samples = dill.loads(byte_rep)
-        return samples
-
-    def write_socket(self, message):
-        # note that this implementation can only send small message
-        # if long message then we need to divide into chunks
-        if self.socket is not None:
-            byte_rep = dill.dumps(message)
-            payload = len(byte_rep).to_bytes(4, 'big') + byte_rep
-            self.socket.sendall(payload)
+    def run(self):
+        from dataset_server.client import DatasetClient
+        import asyncio
+        client = DatasetClient(self.data_queue, self.event_queue, **self.kwargs)
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(client.run())
 
 
 class AsyncDataLoader:

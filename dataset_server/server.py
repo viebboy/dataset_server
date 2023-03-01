@@ -34,26 +34,18 @@ from task_thread import (
     signals
 )
 import copy
-from task_thread import TaskThread as BaseTaskThread
 from loguru import logger
-from dataset_server.common import BinaryBlob, shuffle_indices, Property
 
+from dataset_server.common import (
+    BinaryBlob,
+    shuffle_indices,
+    Property,
+    TaskThread,
+    INTERCOM_HEADER_LEN,
+    object_to_bytes,
+    bytes_to_object,
+)
 
-# size of the header
-INTERCOM_HEADER_LEN = 4
-
-
-def object_to_bytes(dic):
-    """Turn dic into bytes & append the bytes with the bytes length
-    """
-    bytes_ = dill.dumps(dic)
-    le = len(bytes_)
-    bytes_ = le.to_bytes(INTERCOM_HEADER_LEN, "big") + bytes_
-    return bytes_
-
-def bytes_to_object(byte_arr):
-    obj = dill.loads(byte_arr)
-    return obj
 
 def concatenate_list(inputs, device=None):
     """
@@ -336,7 +328,7 @@ class ServerConnectionHandler(TaskThread):
 
     def reset_read_package_state__(self, clearbuf = False):
         self.left = INTERCOM_HEADER_LEN
-        self.len = 0
+        self.obj_len = 0
         self.header = True
         if clearbuf:
             self.read_buf = bytes(0)
@@ -348,23 +340,23 @@ class ServerConnectionHandler(TaskThread):
             self.read_buf += packet
         if self.header:
             if len(self.read_buf) >= INTERCOM_HEADER_LEN:
-                self.len = int.from_bytes(self.read_buf[0:INTERCOM_HEADER_LEN], "big")
+                self.obj_len = int.from_bytes(self.read_buf[0:INTERCOM_HEADER_LEN], "big")
                 self.header = False # we got the header info (length)
                 if len(self.read_buf) > INTERCOM_HEADER_LEN:
                     # sort out the remaining stuff
                     await self.handle_read_packet__(None)
         else:
-            if len(self.read_buf) >= (INTERCOM_HEADER_LEN + self.len):
+            if len(self.read_buf) >= (INTERCOM_HEADER_LEN + self.obj_len):
                 # correct amount of bytes have been obtained
                 payload = bytes_to_object(
-                    self.read_buf[INTERCOM_HEADER_LEN:INTERCOM_HEADER_LEN + self.len]
+                    self.read_buf[INTERCOM_HEADER_LEN:INTERCOM_HEADER_LEN + self.obj_len]
                 )
                 # put reconstructed objects into a queue
                 self.obj_queue.put(payload)
                 # prepare state for next blob
-                if len(self.read_buf) > (INTERCOM_HEADER_LEN + self.len):
+                if len(self.read_buf) > (INTERCOM_HEADER_LEN + self.obj_len):
                     # there's some leftover here for the next blob..
-                    self.read_buf = self.read_buf[INTERCOM_HEADER_LEN + self.len:]
+                    self.read_buf = self.read_buf[INTERCOM_HEADER_LEN + self.obj_len:]
                     self.reset_read_package_state__()
                     # .. so let's handle that leftover
                     await self.handle_read_packet__(None)
