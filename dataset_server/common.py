@@ -227,9 +227,9 @@ class TaskThread(BaseTaskThread):
     """
 
     def __init__(self, name, parent=None):
-        super().__init__(parent=parent)
         self.name = name
         self.parent = parent
+        super().__init__(parent=parent)
 
     async def warn_and_exit(self, function_name, message=''):
         logger.warning(

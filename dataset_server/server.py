@@ -114,39 +114,6 @@ def concatenate_list(inputs, device=None):
     return _concatenate_item(outputs)
 
 
-
-class TaskThread(BaseTaskThread):
-    """
-    A modified base TaskThread class that implements some functionalities
-    """
-
-    def __init__(self, name, parent=None):
-        super().__init__(parent=parent)
-        self.name = name
-        self.parent = parent
-
-    async def warn_and_exit(self, function_name, message=''):
-        logger.warning(
-            f'{self.getInfo()} {function_name}: face issue {message}'
-        )
-        logger.warning(
-            f'{self.getInfo()} {function_name}: exit now...'
-        )
-        await self.stop()
-
-    def getId(self):
-        return str(id(self))
-
-    def getInfo(self):
-        return f"<{self.name} {self.getId()}>"
-
-    def print_info(self, function_name, message):
-        logger.info(f'{self.getInfo()} {function_name}: {message}')
-
-    def print_warning(self, function_name, message):
-        logger.warning(f'{self.getInfo()} {function_name}: {message}')
-
-
 class ServerConnectionHandler(TaskThread):
     """
     This TaskThread is used to handle whenever a new client is connected to the server
@@ -211,8 +178,8 @@ class ServerConnectionHandler(TaskThread):
         try:
             if not self.dataset_length.empty():
                 length = self.dataset_length.get()
-                byte_rep = length.to_bytes(INTERCOM_HEADER_LEN, 'big')
-                self.writer.write(byte_rep)
+                await self.write_socket__(length)
+                logger.info('complete writing dataset length')
 
                 # launch the monitor response task
                 self.tasks.monitor_response = await reCreate(
@@ -310,7 +277,6 @@ class ServerConnectionHandler(TaskThread):
             else:
                 if len(packet) > 0:
                     # all good!  keep on reading = reschedule this
-                    logger.debug(f"read_socket__: got packet with size {len(packet)}")
                     # send the payload to parent:
                     await self.handle_read_packet__(packet)
                     """you can re-schedule with a moderate frequency, say, 100 times per second,

@@ -16,7 +16,6 @@ Apache License 2.0
 
 """
 
-import subprocess
 import dill
 import tempfile
 import time
@@ -26,1033 +25,425 @@ import string
 import random
 import os
 import numpy as np
+import queue
 from queue import Queue
-import threading
 from loguru import logger
-import inspect
-import multiprocessing as MP
-from dataset_server.common import BinaryBlob, shuffle_indices, Property
+import asyncio
+from task_thread import (
+    reCreate,
+    reSchedule,
+    delete,
+    verbose,
+    signals
+)
 
-# size of the header
-INTERCOM_HEADER_LEN = 4
-
-# context in MP
-CTX = MP.get_context('spawn')
-
-
-def get_random_file(length):
-    assert 0 < length < 256
-    alphabet = list(string.ascii_lowercase)
-    random_name = [random.choice(alphabet) for _ in range(length)]
-    random_name = os.path.join(tempfile.gettempdir(), ''.join(random_name))
-    return random_name
-
-def move_data_to_device(data, device):
-    if isinstance(data, (tuple, list)):
-        return [move_data_to_device(item) for item in data]
-    elif isinstance(data, torch.Tensor):
-        return data.to(device, non_blocking=True)
-    else:
-        raise RuntimeError(f'must be a torch tensor to move to device. Got {type(data)}')
-
-def pin_data_memory(x):
-    if isinstance(x, (tuple, list)):
-        return [pin_data_memory(item) for item in x]
-    else:
-        return x.pin_memory()
+from dataset_server.common import (
+    BinaryBlob,
+    TaskThread,
+    INTERCOM_HEADER_LEN,
+    bytes_to_object,
+    object_to_bytes,
+)
 
 
-class Client(CTX.Process):
-    def __init__(self, data_queue, **kwargs):
-        super().__init__()
-        self.verify_arguments(kwargs)
-        self.kwargs = kwargs
+class DatasetClient(TaskThread):
+    """
+    Client side of dataset server
+    This handles minibatch reconstruction from TCP connection
+    This also handle caching on client side
+    """
+    def __init__(self, data_queue, event_queue, **kwargs):
+        # multiprocessing queue to exchange data with another process
+        self.data_queue = data_queue
+        self.event_queue = event_queue
 
-    def verify_arguments(self, kwargs):
-        keys = [
-            'client_index',
-            'port',
-            'max_queue_size',
-            'packet_size',
-            'wait_time',
-            'nb_retry',
-            'rotation_setting',
-            'cache_setting',
-        ]
-        for key in keys:
-            assert key in kwargs
+        # connection related params
+        self.retry_interval = kwargs['retry_interval']
+        self.port = kwargs['port']
+        self.max_retry = kwargs['nb_retry']
+        self.packet_size = kwargs['packet_size']
+        self.host_adr = 'localhost'
 
-    def run(self):
-        self.cache = self.parse_cache_setting()
-        self.rotation = self.parse_rotation_setting()
-        self.start_client__()
+        self.cache = kwargs['cache']
+        self.max_queue_size = kwargs['max_queue_size']
+        self.nearby_shuffle = kwargs['nearby_shuffle']
+        self.client_index = kwargs['client_index']
 
-    def parse_cache_setting(self, cache_setting):
-        cache = None
-        if cache_setting is not None:
-            # cache side must be server or client
-            assert 'side' in cache_setting
-            assert cache_setting['side'] in ['server', 'client']
-            assert 'prefix' in cache_setting
-            if not os.path.exists(os.path.dirname(cache_setting['prefix'])):
-                prefix = cache_setting['prefix']
-                raise RuntimeError('The directory of cache_prefix ({prefix}) does not exist')
-            assert 'update_frequency' in cache_setting
-            if cache_setting['update_frequency'] < 2:
-                msg = (
-                    "there's no point in caching if update_frequency is less than 2; ",
-                    f"received update_frequency={update_frequency}"
-                )
-                raise RuntimeError(''.join(msg))
-
-            # now if caching on client side, create a property space to hold
-            # all of properties
-            if cache_setting['side'] == 'client':
-                cache = Property()
-                cache.side = cache_setting['side']
-                cache.prefix = cache_setting['prefix']
-                cache.update_frequency = cache_setting['update_frequency']
-        return cache
-
-    def parse_rotation_setting(self):
-        """
-        this should be called after parse_cache_setting()
-        """
-        rotation = Property()
-        rotation_setting = self.kwargs['rotation_setting']
-        max_queue_size = self.kwargs['max_queue_size']
-
-        if rotation_setting is None:
-            rotation.max_rotation = 1
-            rotation.min_size = 1
-            rotation.max_size = max_queue_size
-            rotation.medium = 'memory'
-        else:
-            assert 'rotation' in rotation_setting
-            assert 'min_rotation_size' in rotation_setting
-            assert 'max_rotation_size' in rotation_setting
-            rotation.max_rotation = rotation_setting['rotation']
-            rotation.min_size = rotation_setting['min_rotation_size']
-            rotation.max_size = rotation_setting['max_rotation_size']
-
-            assert 'medium' in rotation_setting
-            assert rotation_setting['medium'] in ['memory', 'disk']
-            rotation.medium = rotation_setting['medium']
-
-            if rotation.medium == 'disk':
-                assert 'prefix' in rotation_setting
-                if not os.path.exists(os.path.dirname(rotation_setting['prefix'])):
-                    prefix = rotation_setting['prefix']
-                    raise RuntimeError('The directory of file_prefix ({prefix}) does not exist')
-                rotation.prefix = rotation_setting['prefix']
-
-            if rotation.medium == 'disk' and self.cache is not None:
-                msg = (
-                    'Caching on client side and rotation on disk can lead to unncessary overhead; ',
-                    'Consider using memory as rotation medium and caching on client; ',
-                    'Or using disk as rotation medium and no caching (or caching on server side);'
-                )
-                raise RuntimeError(''.join(msg))
-
-            if rotation.max_rotation < 2:
-                msg = (
-                    'the number of rotations should be at least 2; ',
-                    f'received {rotation.max_rotation}'
-                )
-                raise RuntimeError(''.join(msg))
-
-            assert rotation.min_size >= 1,\
-                'min_rotation_size must be at least 1'
-
-            assert rotation.max_size >= 2,\
-                'max_rotation_size must be at least 2'
-
-            if rotation.max_size <= rotation.min_size:
-                msg = (
-                    'max_rotation_size must be larger than min_rotation_size; ',
-                    f'received max_rotation_size={rotation.max_size}, ',
-                    f'min_rotation_size={rotation.min_size}'
-                )
-                raise RuntimeError(''.join(msg))
-
-            invalid_min_size = (
-                rotation.max_rotation > 1 and
-                side == 'server' and
-                rotation.medium == 'memory' and
-                rotation.min_size <= self.batch_size
-            )
-            if invalid_min_size:
-                msg = (
-                    'when rotation on memory on server side is specified, ',
-                    f'min_rotation_size ({rotation.min_size}) must be larger ',
-                    f'than batch_size ({self.batch_size}); ',
-                    'this is to ensure that a sample is not repeated many times in the same minibatch',
-                )
-                raise RuntimeError(''.join(msg))
-
-            invalid_max_size = (
-                rotation.max_rotation > 1 and
-                side == 'server' and
-                rotation.medium == 'disk' and
-                rotation.max_size < self.batch_size
-            )
-            if invalid_max_size:
-                msg = (
-                    'when rotation on disk on server side is specified, ',
-                    f'max_rotation_size ({rotation.max_size}) must be at least ',
-                    f'batch_size ({self.batch_size}); ',
-                    'this is to ensure that enough samples are written to file for rotation',
-                )
-                raise RuntimeError(''.join(msg))
-
-        return rotation
-
-    def start_client__(self):
-        # start the client
-        logger.info(f'starting client connection at port {kwargs["port"]}')
-        self.client_connection = ClientConnection(
-            index=kwargs['client_index'],
-            port=kwargs['port'],
-            packet_size=kwargs['packet_size'],
-            wait_time=kwargs['wait_time'],
-            nb_retry=kwargs['nb_retry'],
+        super(DatasetClient, self).__init__(
+            parent=None,
+            name='DatasetClient',
         )
-        self.nb_minibatch = len(client_connection)
 
-def fetch_data(
-    clients,
-    data_queue,
-    rotation_queue,
-    max_queue_size,
-    close_event,
-    pin_memory,
-    cache,
-    rotation,
-    nearby_shuffle,
-):
-    # get the sample from the 1st client in the client list
-    nb_client = len(clients)
-    client_indices = list(range(nb_client))
-    record = None
-    current_epoch = 0
-    minibatch_count = 0
-    total_minibatch = sum([len(client) for client in clients])
+    def initVars__(self):
+        self.tasks.read_socket = None
+        self.tasks.write_socket = None
+        self.tasks.init_connection = None
+        # payload includes: nb of minibatches, actual minibatches
+        # process payload doesnt need to write back to server because
+        # read_socket handles this
+        self.tasks.process_payload = None
+        # this process is used to monitor the event queue
+        self.tasks.monitor_event = None
 
-    # rotation counter
-    rotation.read_indices = None
-    rotation.current_round = 0
-    rotation.write_idx = 0
-    rotation.ignored_indices = []
+        # reader and writer objects
+        self.reader, self.writer = None, None
 
-    # handle cache setting
-    if cache is not None and cache.side == 'client':
-        # need caching
-        cache_binary_file = cache.prefix + '.bin'
-        cache_index_file = cache.prefix + '.idx'
-        cache.record = BinaryBlob(cache_binary_file, cache_index_file, mode='w')
-    else:
-        cache = None
+        # flags to keep track of connection status
+        self.is_connected = False
+        self.cur_attempt = 0
 
-    # handle rotation setting
-    if rotation.medium == 'disk':
-        part_a = BinaryBlob(
-            binary_file=rotation.prefix + 'A.bin',
-            index_file=rotation.prefix + 'A.idx',
-            mode='w',
-        )
-        part_b = BinaryBlob(
-            binary_file=rotation.prefix + 'B.bin',
-            index_file=rotation.prefix + 'B.idx',
-            mode='w',
-        )
-        rotation.records = [part_a, part_b]
-    else:
-        rotation.records = None
+        # calling reset is necessary to initialize reader
+        self.reset_read_package_state__(True)
 
-    while True:
-        if close_event.is_set():
-            logger.info(f'receive signal to close data fetcher thread, closing now...')
-            if cache is not None:
-                cache.record.close()
-            return
+        # this queue is for holding received objects
+        self.received_payload = Queue()
 
-        # -------------------- Rotation Handling ----------------------------
-        if rotation.medium == 'memory':
-            # if rotate on memory, we simply move samples from data_queue to
-            # rotation_queue until reaching the max size
-            r_size = rotation_queue.qsize()
-            if r_size <= rotation.max_size:
-                for _ in range(rotation.max_size + 1 - r_size):
-                    if not data_queue.empty():
-                        minibatch = data_queue.get()
-                        rotation_queue.put((1, minibatch))
-                    else:
-                        break
-        else:
-            # rotate on disk
-            # records[0] is always for reading (if mode is read)
-            # records[1] is always for writing (if mode is write)
-            # in disk rotation, we use max_queue_size as the threshold for
-            # rotation_queue
-            # max_rotation_size is used as the number of samples in a cache
-            # file
-            r_size = rotation_queue.qsize()
-            if r_size <= max_queue_size:
-                if rotation.records[0].mode() == 'read':
-                    # if there is rotation record for reading
-                    if len(rotation.read_indices) > 0:
-                        idx = rotation.read_indices.pop(0)
-                        minibatch = rotation.records[0].read_index(idx)
-                        # putting rot together with minibatch to
-                        # prevent __next__() in asyncloader putting
-                        # this minibatch batch back
-                        # basically rotation is handled in this
-                        # function
-                        rotation_queue.put((rotation.max_rotation, minibatch))
+        # total minibatch is the 1st payload sent by server
+        self.total_minibatch = None
+        self.minibatch_idx = 0
 
-                    # if we run out of indices, we need to increase
-                    # rot_counter, which keeps track of how many rotations on
-                    # this record has been made
-                    if len(rotation.read_indices) == 0:
-                        rotation.current_round += 1
-                        if rotation.current_round >= rotation.max_rotation:
-                            # if exceeding the number of rotations
-                            # we dont read from this record anymore
-                            # put this record into write mode
-                            rotation.current_round = 0
-                            rotation.read_indices = None
-                            rotation.records[0].close()
-                            rotation.records[0] = BinaryBlob(
-                                binary_file=rotation.records[0].binary_file(),
-                                index_file=rotation.records[0].index_file(),
-                                mode='w',
-                            )
-                        else:
-                            # if not exceeding the rotation limit
-                            # recreate a list of indices again
-                            rotation.read_indices = shuffle_indices(
-                                start_idx=0,
-                                stop_idx=len(rotation.records[0]),
-                                nearby_shuffle=nearby_shuffle,
-                            )
+        # counter to check whether payload queue is full
+        self.read_socket_counter = self.max_queue_size
 
-                if rotation.records[1].mode() == 'write':
-                    # if 2nd record is in write mode, we need get from
-                    # data_queue and write to records
-                    if not data_queue.empty():
-                        minibatch = data_queue.get()
-                        rotation.records[1].write_index(rotation.write_idx, minibatch)
-                        # if 1st record in write mode, we need to also put
-                        # this minibatch into the rotation queue
-                        if rotation.records[0].mode() == 'write':
-                            # queued_indices keep track of which samples
-                            # have been sent to the rotation queue
-                            rotation.ignored_indices.append(rotation.write_idx)
-                            rotation_queue.put((rotation.max_rotation, minibatch))
-
-                        rotation.write_idx += 1
-
-                    # check if we reach max_rotation_size
-                    # then we need to close this record
-                    if rotation.write_idx == rotation.max_size:
-                        rotation.write_idx = 0
-                        rotation.records[1].close()
-                        # then open again in read mode
-                        rotation.records[1] = BinaryBlob(
-                            binary_file=rotation.records[1].binary_file(),
-                            index_file=rotation.records[1].index_file(),
-                            mode='r',
-                        )
-
-                if rotation.records[0].mode() == 'write' and rotation.records[1].mode() == 'read':
-                    # swap position
-                    rotation.records = rotation.records[::-1]
-                    # then create a list of indices for future readout
-                    rotation.read_indices = shuffle_indices(
-                        start_idx=0,
-                        stop_idx=len(rotation.records[0]),
-                        nearby_shuffle=nearby_shuffle,
-                    )
-                    # remove those that are already in the rotation queue
-                    rotation.read_indices = [
-                        i for i in rotation.read_indices if i not in rotation.ignored_indices
-                    ]
-                    # reset queued_indices
-                    rotation.ignored_indices = []
-
-
-        # --------------------- Data Handling From Server --------------------
-        # --------------------- This includes caching on client side ---------
-        if cache is None:
-            from_server = True
-        else:
-            if current_epoch == 0:
-                # 1st epoch, if record in read mode
-                # it means cache exists, just need to read from cache
-                if cache.record.mode() == 'read':
-                    from_server = False
-                else:
-                    from_server = True
+        # initialize counter for cache
+        if self.cache is not None:
+            self.cache.current_epoch = 0
+            binary_file = self.cache.prefix + f'_{self.client_index}.bin'
+            index_file = self.cache.prefix + f'_{self.client_index}.idx'
+            if os.path.exists(binary_file) and os.path.exists(index_file):
+                mode = 'r'
             else:
-                if current_epoch % cache.update_frequency == 0:
-                    from_server = True
-                else:
-                    from_server = False
+                mode = 'w'
 
+            self.cache.record = BinaryBlob(
+                binary_file=binary_file,
+                index_file=index_file,
+                mode=mode
+            )
 
-        if data_queue.qsize() <= max_queue_size:
+        logger.info("initVars__: {}".format(self.getInfo()))
+
+    @verbose
+    async def enter__(self):
+        self.tasks.init_connection = await reCreate(self.tasks.init_connection, self.init_connection__)
+        logger.debug("enter__: {}".format(self.getInfo()))
+
+    async def init_connection__(self):
+        """
+        connect to a server
+        retry if not successful
+        then start reading socket
+        """
+        try:
             try:
-                if from_server:
-                    # if reading from server
-                    # check if 1st sample from the server and record in
-                    # read mode, then we need to close the record and open
-                    # again in write mode
-                    if minibatch_count == 0 and cache is not None and cache.record.mode() == 'read':
-                        # close
-                        cache.record.close()
-                        # then open again for writing
-                        cache.record = BinaryBlob(
-                            cache.record.binary_file(),
-                            cache.record.index_file(),
-                            mode='w',
+                self.cur_attempt += 1
+                self.reader, self.writer = await asyncio.open_connection(
+                    self.host_adr, self.port
+                )
+
+                logger.info(
+                    "init_connection__: successfully connected to {} on port {}".format(
+                        self.host_adr,
+                        self.port
+                    )
+                )
+                self.is_connected = True
+                # reset the number of attempts
+                self.cur_attempt = 0
+                # start reading from socket
+                self.tasks.read_socket = await reCreate(
+                    self.tasks.read_socket,
+                    self.read_socket__
+                )
+                # also start processing payload
+                self.tasks.process_payload = await reCreate(
+                    self.tasks.process_payload,
+                    self.process_payload__
+                )
+
+            except Exception as e:
+                logger.info("init_connection__: connect failed with", e)
+                await self.reset_connection__()
+                if self.cur_attempt <= self.max_retry:
+                    logger.info(f"init_connection__: trying to reconnect within {self.retry_interval} secs")
+                    await asyncio.sleep(self.retry_interval)
+                    # schedule a task to reconnect
+                    self.tasks.init_connection = await reSchedule(
+                        self.init_connection__
+                    )
+                else:
+                    await self.warn_and_exit(
+                        'init_connection__',
+                        'reaching max attempt',
+                    )
+
+        except asyncio.CancelledError:
+            logger.info("init_connection__ : cancelling %s", self.getInfo())
+        except Exception as e:
+            await self.warn_and_exit('init_connection__', str(e))
+
+    async def reset_connection__(self):
+        if self.writer is not None:
+            self.writer.close()
+            await self.writer.wait_closed()
+        self.is_connected = False
+
+
+    @verbose
+    async def exit__(self):
+        await self.reset_connection__()
+        self.tasks.read_socket = await delete(self.tasks.read_socket)
+        self.tasks.write_socket = await delete(self.tasks.write_socket)
+        self.tasks.init_connection = await delete(self.tasks.init_connection)
+        self.tasks.process_payload = await delete(self.tasks.process_payload)
+        self.tasks.monitor_event = await delete(self.tasks.monitor_event)
+        logger.debug(f"{self.getInfo()} exit__: bye!")
+
+    async def write_socket__(self, obj=None):
+        """
+        Send an object to the server
+        """
+        try:
+            # handle the case when not connected yet
+            if not self.is_connected:
+                await asyncio.sleep(0.01)
+                await self.write_socket__(obj)
+                return
+
+            if obj is not None:
+                # convert to byte array
+                self.write_buf = object_to_bytes(obj)
+                self.write_start = 0
+                # then reschedule to call this task again
+                self.tasks.write_socket = await reSchedule(self.write_socket__)
+            else:
+                # this part is the actual writing part
+                # we will write one blob of BLOCK_SIZE at a time
+                # and allow returning the control to the main loop if needed
+                if self.write_start < len(self.write_buf):
+                    write_stop = min(len(self.write_buf), self.write_start + self.packet_size)
+                    try:
+                        self.writer.write(self.write_buf[self.write_start:write_stop])
+                        await self.writer.drain()
+                    except Exception as e:
+                        await self.warn_and_exit('write_socket__', str(e))
+                    else:
+                        self.write_start = write_stop
+                        self.tasks.write_socket = await reSchedule(self.write_socket__)
+
+        except asyncio.CancelledError:
+            logger.info("write_socket__ : cancelling %s", self.getInfo())
+        except Exception as e:
+            await self.warn_and_exit('write_socket__', str(e))
+
+    async def read_socket__(self):
+        """
+        Read byte stream from the server
+        """
+        try:
+            if self.read_socket_counter > 0:
+                can_read = True
+                self.read_socket_counter -= 1
+            else:
+                if self.received_payload.qsize() > self.max_queue_size:
+                    can_read = False
+                else:
+                    can_read = True
+                self.read_socket_counter = self.max_queue_size
+
+            if can_read:
+                try:
+                    packet = await self.reader.read(self.packet_size)
+                    if len(packet) > 0:
+                        # all good!  keep on reading = reschedule this
+                        await self.handle_read_packet__(packet)
+                        # reschedule the task
+                        self.tasks.read_socket = await reSchedule(self.read_socket__)
+                    else:
+                        await self.warn_and_exit(
+                            'read_socket__',
+                            'server has closed connection',
                         )
 
-                    leftover, minibatch = clients[client_indices[0]].get()
-                    if cache is not None:
-                        cache.record.write_index(minibatch_count, minibatch)
+                except Exception as e:
+                    await self.warn_and_exit(
+                        'read_socket__',
+                        str(e),
+                    )
+            else:
+                await asyncio.sleep(0.001)
+                self.tasks.read_socket = await reSchedule(self.read_socket__)
 
-                    if pin_memory:
-                        minibatch = pin_data_memory(minibatch)
-
-                    data_queue.put(minibatch)
-                    minibatch_count += 1
-
-                    if leftover == 0:
-                        # remove the client from the list
-                        client_indices.pop(0)
-                        if len(client_indices) == 0:
-                            # if empty, reinitialize
-                            client_indices = list(range(nb_client))
-                            # then reset the counter
-                            minibatch_count = 0
-                            current_epoch += 1
-                            if cache is not None:
-                                # if record is not None, we also need to close
-                                # the record to finish the writing process
-                                cache.record.close()
-                                # then open record again in read mode
-                                cache.record = BinaryBlob(
-                                    cache.record.binary_file(),
-                                    cache.record.index_file(),
-                                    mode='r',
-                                )
-                    else:
-                        # rotate the list
-                        client_indices.append(client_indices.pop(0))
-                else:
-                    # if reading from cache file
-                    minibatch = cache.record.read_index(minibatch_count)
-
-                    if pin_memory:
-                        minibatch = pin_data_memory(minibatch)
-
-                    data_queue.put(minibatch)
-                    minibatch_count += 1
-
-                    # reset counter
-                    if minibatch_count == total_minibatch:
-                        current_epoch += 1
-                        minibatch_count = 0
-
-            except RuntimeError as e:
-                # put None to data queue
-                # then put error message
-                data_queue.put(None)
-                data_queue.put(str(e))
-                for client in clients:
-                    client.close()
-                raise RuntimeError(str(e))
-        else:
-            time.sleep(0.001)
-
-
-class ClientConnection:
-    def __init__(self, index, port, packet_size: int, hostname='localhost', wait_time=10, nb_retry=10):
-        self.index = index
-        self.port = port
-        self.hostname = hostname
-        self.socket = None
-        self.wait_time = wait_time
-        self.nb_retry = nb_retry
-        self.size = None
-        self.packet_size = packet_size
-
-        # initialize connection
-        self.init_connection()
-
-        # counter to track minibatch
-        self.minibatch_count = 0
-
-    def __len__(self):
-        return self.size
-
-    def get(self):
-        try:
-            if self.minibatch_count == self.size:
-                self.minibatch_count = 0
-
-            samples = self.read_socket()
-            self.write_socket('ok')
-            self.minibatch_count += 1
-            return self.size - self.minibatch_count, samples
+        except asyncio.CancelledError:
+            self.print_warning(
+                'read_socket__',
+                'got canceled',
+            )
 
         except Exception as e:
-            logger.warning('face the following exception')
-            logger.warning(str(e))
-            self.close()
-            raise RuntimeError(str(e))
+            await self.warn_and_exit('read_socket__', str(e))
 
-    def close(self):
-        if self.socket is not None:
-            logger.info(f'closing connection to {self.hostname} at port {self.port}')
-            self.socket.close()
-            self.socket = None
 
-    def init_connection(self):
-        if self.socket is None:
-            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            count = 0
+    def reset_read_package_state__(self, clearbuf = False):
+        self.left = INTERCOM_HEADER_LEN
+        self.obj_len = 0
+        self.header = True
+        if clearbuf:
+            self.read_buf = bytes(0)
 
-            # try to connect
-            success = False
-            while True:
-                try:
-                    self.socket.connect((self.hostname, self.port))
-                    logger.info(f'connected to server {self.hostname} at port {self.port}')
-                    success = True
-                    break
-                except Exception as e:
-                    time.sleep(self.wait_time)
-                    count += 1
-                    msg = (
-                        f'failed to connect at the {count}-th attempt! ',
-                        f'wating {self.wait_time} seconds before retrying'
-                    )
-                    logger.warning(''.join(msg))
-                    if count >= self.nb_retry:
-                        logger.warning(f'failed to connect after retrying {self.nb_retry} times')
-                        logger.warning('terminating now!!!')
-                        break
-
-            # disable naggle algorithm
-            #self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, True)
-
-            # now read the size of the dataset (number of minibatches)
-            # the size is sent as 4 bytes
-            if success:
-                self.size = int.from_bytes(self.socket.recv(4), 'big')
-                self.write_socket('ok')
-            else:
-                raise RuntimeError(f'failed to connect after retrying {self.nb_retry} times')
-
-    def read_socket(self):
+    async def handle_read_packet__(self, packet):
+        """packet reconstructions into blobs of certain length
         """
-        first read header (4 bytes), which contains the size of the object
-        then read the object
-        """
-        # read the header
-        header = self.socket.recv(INTERCOM_HEADER_LEN)
-        # compute the object length
-        obj_len = int.from_bytes(header, 'big')
-        # then read the object length
-        nb_byte_left = obj_len
-        byte_rep = bytes()
-        while nb_byte_left > 0:
-            block_size = min(nb_byte_left, self.packet_size)
-            bytes_ = self.socket.recv(block_size)
-            if len(bytes_) < 1:
-                sys.exit(2)
-            byte_rep += bytes_
-            nb_byte_left -= len(bytes_)
-
-        samples = dill.loads(byte_rep)
-        return samples
-
-    def write_socket(self, message):
-        # note that this implementation can only send small message
-        # if long message then we need to divide into chunks
-        if self.socket is not None:
-            byte_rep = dill.dumps(message)
-            payload = len(byte_rep).to_bytes(4, 'big') + byte_rep
-            self.socket.sendall(payload)
-
-
-class AsyncDataLoader:
-    def __init__(
-        self,
-        dataset_class,
-        dataset_params: dict,
-        batch_size: int,
-        nb_servers: int,
-        start_port: int=11111,
-        max_queue_size: int=20,
-        shuffle: bool=False,
-        device=None,
-        pin_memory=False,
-        packet_size=125000,
-        wait_time=10,
-        client_wait_time=10,
-        nb_retry=10,
-        gpu_indices=None,
-        nearby_shuffle: int=0,
-        cache_setting=None,
-        client_rotation_setting=None,
-        server_rotation_setting=None,
-    ):
-        try:
-            dataset_tmp = dataset_class(**dataset_params)
-            del dataset_tmp
-        except Exception as error:
-            logger.warning('failed to construct the dataset with the following error')
-            raise error
-
-        if gpu_indices is not None:
-            assert len(gpu_indices) == nb_servers
-
-        # check the cache setting
-        self.check_cache_setting(cache_setting)
-
-        # assign batch size then check rotation setting
-        self.batch_size = batch_size
-        self.rotation = self.check_rotation_setting(client_rotation_setting, 'client', max_queue_size)
-        self.check_rotation_setting(server_rotation_setting, 'server', max_queue_size)
-
-
-        # start the servers
-        logger.info('starting services, this will take a while')
-        self.status_files = self.start_servers(
-            dataset_class=dataset_class,
-            dataset_params=dataset_params,
-            batch_size=batch_size,
-            nb_servers=nb_servers,
-            start_port=start_port,
-            max_queue_size=max_queue_size,
-            shuffle=shuffle,
-            packet_size=packet_size,
-            gpu_indices=gpu_indices,
-            nearby_shuffle=nearby_shuffle,
-            cache_setting=cache_setting,
-            rotation_setting=server_rotation_setting,
-        )
-        self.wait_for_servers()
-
-        self.is_closed = False
-        self.is_client_available = False
-
-        # start clients
-        self.start_clients(packet_size, client_wait_time, nb_retry)
-        self.is_client_available = True
-
-        # counter to track minibatch
-        self.minibatch_count = 0
-
-        # start the thread to reconstruct data and put them into a queue
-        self.data_queue = Queue()
-        self.rotation_queue = Queue()
-        self.device = device
-
-        # use python threading
-        self.fetcher_close_event = threading.Event()
-        self.data_thread = threading.Thread(
-            target=fetch_data,
-            args=(
-                self.clients,
-                self.data_queue,
-                self.rotation_queue,
-                max_queue_size,
-                self.fetcher_close_event,
-                pin_memory,
-                self.cache,
-                self.rotation,
-                nearby_shuffle,
-            )
-        )
-        self.data_thread.start()
-        # wait a bit to generate some samples before returning
-        logger.info(f'waiting {wait_time} seconds to preload some samples')
-        time.sleep(wait_time)
-
-    def check_cache_setting(self, cache_setting):
-        self.cache = None
-        if cache_setting is not None:
-            # cache side must be server or client
-            assert 'side' in cache_setting
-            assert cache_setting['side'] in ['server', 'client']
-            assert 'prefix' in cache_setting
-            if not os.path.exists(os.path.dirname(cache_setting['prefix'])):
-                prefix = cache_setting['prefix']
-                raise RuntimeError('The directory of cache_prefix ({prefix}) does not exist')
-            assert 'update_frequency' in cache_setting
-            if cache_setting['update_frequency'] < 2:
-                msg = (
-                    "there's no point in caching if update_frequency is less than 2; ",
-                    f"received update_frequency={update_frequency}"
-                )
-                raise RuntimeError(''.join(msg))
-
-            # now if caching on client side, create a property space to hold
-            # all of properties
-            if cache_setting['side'] == 'client':
-                self.cache = Property()
-                self.cache.side = cache_setting['side']
-                self.cache.prefix = cache_setting['prefix']
-                self.cache.update_frequency = cache_setting['update_frequency']
-
-
-    def check_rotation_setting(self, rotation_setting, side, max_queue_size):
-        rotation = Property()
-        if rotation_setting is None:
-            rotation.max_rotation = 1
-            rotation.min_size = 1
-            rotation.max_size = max_queue_size
-            rotation.medium = 'memory'
+        if packet is not None:
+            self.read_buf += packet
+        if self.header:
+            if len(self.read_buf) >= INTERCOM_HEADER_LEN:
+                self.obj_len = int.from_bytes(self.read_buf[0:INTERCOM_HEADER_LEN], "big")
+                self.header = False # we got the header info (length)
+                if len(self.read_buf) > INTERCOM_HEADER_LEN:
+                    # sort out the remaining stuff
+                    await self.handle_read_packet__(None)
         else:
-            assert 'rotation' in rotation_setting
-            assert 'min_rotation_size' in rotation_setting
-            assert 'max_rotation_size' in rotation_setting
-            rotation.max_rotation = rotation_setting['rotation']
-            rotation.min_size = rotation_setting['min_rotation_size']
-            rotation.max_size = rotation_setting['max_rotation_size']
-
-            assert 'medium' in rotation_setting
-            assert rotation_setting['medium'] in ['memory', 'disk']
-            rotation.medium = rotation_setting['medium']
-
-            if rotation.medium == 'disk':
-                assert 'prefix' in rotation_setting
-                if not os.path.exists(os.path.dirname(rotation_setting['prefix'])):
-                    prefix = rotation_setting['prefix']
-                    raise RuntimeError('The directory of file_prefix ({prefix}) does not exist')
-                rotation.prefix = rotation_setting['prefix']
-
-            if side == 'client' and rotation.medium == 'disk' and self.cache is not None:
-                msg = (
-                    'Caching on client side and rotation on disk can lead to unncessary overhead; ',
-                    'Consider using memory as rotation medium and caching on client; ',
-                    'Or using disk as rotation medium and no caching (or caching on server side);'
+            if len(self.read_buf) >= (INTERCOM_HEADER_LEN + self.obj_len):
+                # correct amount of bytes have been obtained
+                payload = bytes_to_object(
+                    self.read_buf[INTERCOM_HEADER_LEN:INTERCOM_HEADER_LEN + self.obj_len]
                 )
-                raise RuntimeError(''.join(msg))
+                if self.total_minibatch is None:
+                    logger.info(f'received total minibatch: {payload}')
+                    self.total_minibatch = payload
+                    self.event_queue.put({'status': 'ready', 'total_minibatch': self.total_minibatch})
 
-            if rotation.max_rotation < 2:
-                msg = (
-                    'the number of rotations should be at least 2; ',
-                    f'received {rotation.max_rotation}'
-                )
-                raise RuntimeError(''.join(msg))
-
-            assert rotation.min_size >= 1,\
-                'min_rotation_size must be at least 1'
-
-            assert rotation.max_size >= 2,\
-                'max_rotation_size must be at least 2'
-
-            if rotation.max_size <= rotation.min_size:
-                msg = (
-                    'max_rotation_size must be larger than min_rotation_size; ',
-                    f'received max_rotation_size={rotation.max_size}, ',
-                    f'min_rotation_size={rotation.min_size}'
-                )
-                raise RuntimeError(''.join(msg))
-
-            invalid_min_size = (
-                rotation.max_rotation > 1 and
-                side == 'server' and
-                rotation.medium == 'memory' and
-                rotation.min_size <= self.batch_size
-            )
-            if invalid_min_size:
-                msg = (
-                    'when rotation on memory on server side is specified, ',
-                    f'min_rotation_size ({rotation.min_size}) must be larger ',
-                    f'than batch_size ({self.batch_size}); ',
-                    'this is to ensure that a sample is not repeated many times in the same minibatch',
-                )
-                raise RuntimeError(''.join(msg))
-
-            invalid_max_size = (
-                rotation.max_rotation > 1 and
-                side == 'server' and
-                rotation.medium == 'disk' and
-                rotation.max_size < self.batch_size
-            )
-            if invalid_max_size:
-                msg = (
-                    'when rotation on disk on server side is specified, ',
-                    f'max_rotation_size ({rotation.max_size}) must be at least ',
-                    f'batch_size ({self.batch_size}); ',
-                    'this is to ensure that enough samples are written to file for rotation',
-                )
-                raise RuntimeError(''.join(msg))
-
-        return rotation
-
-
-    def wait_for_servers(self):
-        logger.info('waiting for servers to load dataset...')
-        while True:
-            ready = True
-            for file in self.status_files:
-                if not os.path.exists(file):
-                    ready = False
-                    break
-            if not ready:
-                time.sleep(1)
-            else:
-                break
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        self.close()
-
-    def start_clients(self, packet_size, wait_time, nb_retry):
-        """
-        start the socket clients
-        """
-        self.clients = []
-        self.sizes = []
-        self.total_minibatch = 0
-        self.client_indices = []
-
-        for index, port in enumerate(self.ports):
-            logger.info(f'starting DatasetClient number {index} at port: {port}')
-            try:
-                new_client = DatasetClient(
-                    index=index,
-                    port=port,
-                    packet_size=packet_size,
-                    wait_time=wait_time,
-                    nb_retry=nb_retry,
-                )
-            except Exception as error:
-                self.close()
-                raise error
-
-            self.clients.append(new_client)
-            self.sizes.append(len(new_client))
-            self.total_minibatch += len(new_client)
-            self.client_indices.append(index)
-
-        self.nb_client = len(self.sizes)
-
-    def close(self):
-        if not self.is_closed:
-            logger.info('closing the AsyncDataLoader instance')
-            # close the thread running DatasetClient
-            if self.is_client_available:
-                self.fetcher_close_event.set()
-                self.data_thread.join()
-
-                for client in self.clients:
-                    client.close()
-
-            # close the dataset servers
-            for server in self.servers:
-                server.kill()
-
-            # delete status files
-            for file in self.status_files:
-                if os.path.exists(file):
-                    os.remove(file)
-
-            self.is_closed = True
-            self.is_client_available = False
-
-    def start_servers(
-        self,
-        dataset_class,
-        dataset_params: dict,
-        batch_size: int,
-        nb_servers: int,
-        start_port: int,
-        max_queue_size: int,
-        shuffle: bool,
-        packet_size: int,
-        gpu_indices: list,
-        nearby_shuffle: bool,
-        cache_setting: dict,
-        rotation_setting: dict,
-    ):
-        """
-        start the dataset servers
-        """
-
-        class_name = dataset_class.__name__
-        dataset_module_file = inspect.getfile(dataset_class)
-        logger.info(f'dataset_module file: {dataset_module_file}')
-        logger.info(f'dataset_module name: {class_name}')
-
-        # dump dataset-related data to a random file
-        dataset_params_file = get_random_file(length=32)
-        # mainify dataset params:
-        #mainify(dataset_params)
-
-        with open(dataset_params_file, 'wb') as fid:
-            dill.dump(
-                {
-                    'class_name': class_name,
-                    'params': dataset_params,
-                    'cache_setting': cache_setting,
-                    'rotation_setting': rotation_setting,
-                },
-                fid,
-                recurse=True
-            )
-
-        # create random files to write status after server is available
-        status_files = [get_random_file(32) for _ in range(nb_servers)]
-
-        # start the server
-        self.servers = []
-        self.ports = []
-        for server_idx in range(nb_servers):
-            logger.info(f'starting dataset server {server_idx +1}')
-            all_env_var = os.environ.copy()
-            if gpu_indices is not None:
-                indices = gpu_indices[server_idx]
-                if isinstance(indices, int):
-                    indices = [indices,]
-                env_var = ','.join([str(v) for v in indices])
-                #TODO: check the case when script is run with CUDA_VISIBLE_DEVICES
-                all_env_var['CUDA_VISIBLE_DEVICES'] = env_var
-
-            process = subprocess.Popen(
-                [
-                    'serve-dataset',
-                    '--port',
-                    str(start_port),
-                    '--dataset-file',
-                    dataset_module_file,
-                    '--dataset-parameter-file',
-                    dataset_params_file,
-                    '--nb-server',
-                    str(nb_servers),
-                    '--server-index',
-                    str(server_idx),
-                    '--batch-size',
-                    str(batch_size),
-                    '--max-queue-size',
-                    str(max_queue_size),
-                    '--shuffle',
-                    str(shuffle),
-                    '--packet-size',
-                    str(packet_size),
-                    '--status-file',
-                    status_files[server_idx],
-                    '--nearby-shuffle',
-                    str(nearby_shuffle),
-                ],
-                env=all_env_var,
-            )
-            time.sleep(2)
-            self.servers.append(process)
-            self.ports.append(start_port)
-            start_port += 1
-
-        return status_files
-
-
-    def __len__(self):
-        return max(1, self.rotation.max_rotation) * self.total_minibatch
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        if self.minibatch_count >= max(1, self.rotation.max_rotation) * self.total_minibatch:
-            self.minibatch_count = 0
-            raise StopIteration
-
-        while True:
-            if self.rotation.max_rotation > 1:
-                # rotation is enabled
-                if (self.rotation_queue.qsize() >= self.rotation.min_size or self.minibatch_count > 0):
-                    # has some minimum elements
-                    readout = self.rotation_queue.get()
-                    if readout is None:
-                        error = self.rotation_queue.get()
-                        self.close()
-                        logger.warning(f'got error: {error}')
-                        raise RuntimeError(error)
-
-                    counter, minibatch = readout
-                    if counter < self.rotation.max_rotation:
-                        self.rotation_queue.put((counter+1, minibatch))
-                    break
+                    # start task to monitor event queue
+                    self.tasks.monitor_event = await reCreate(
+                        self.tasks.monitor_event,
+                        self.monitor_event__
+                    )
                 else:
-                    time.sleep(0.001)
-            else:
-                # no rotation, dont care about min rotation size
-                if not self.rotation_queue.empty():
-                    readout = self.rotation_queue.get()
-                    if readout is None:
-                        error = self.rotation_queue.get()
-                        self.close()
-                        logger.warning(f'got error: {error}')
-                        raise RuntimeError(error)
+                    # put reconstructed objects into a queue
+                    self.received_payload.put((self.minibatch_idx, payload))
+                    self.minibatch_idx += 1
+                    if self.minibatch_idx == self.total_minibatch:
+                        # reset counter
+                        self.minibatch_idx = 0
+                        # put None to signal the end of epoch
+                        self.received_payload.put(None)
 
-                    counter, minibatch = readout
-                    break
+                # also write confirmation back to the server
+                await self.write_socket__('ok')
+
+                # prepare state for next blob
+                if len(self.read_buf) > (INTERCOM_HEADER_LEN + self.obj_len):
+                    # there's some leftover here for the next blob..
+                    self.read_buf = self.read_buf[INTERCOM_HEADER_LEN + self.obj_len:]
+                    self.reset_read_package_state__()
+                    # .. so let's handle that leftover
+                    await self.handle_read_packet__(None)
                 else:
-                    time.sleep(0.001)
+                    # blob ends exactly
+                    self.reset_read_package_state__(clearbuf=True)
 
-        # increase the minibatch counter
-        self.minibatch_count += 1
+    def is_data_from_server(self):
+        if self.cache is None:
+            return True
+        if self.cache.current_epoch == 0:
+            self.cache.read_indices = shuffle_indices(0, self.total_minibatch, self.nearby_shuffle)
+            if self.cache.record.mode() == 'read':
+                return False
+            else:
+                return True
+        else:
+            if self.cache.current_epoch % self.cache.update_frequency == 0:
+                return True
+            else:
+                return False
 
-        if self.device is not None:
-            minibatch = move_data_to_device(minibatch, device)
+    @verbose
+    async def process_payload__(self):
+        """
+        recurring task to process the received_payload queue
+        """
+        try:
+            # check whether we need to read from cache or process the payload queue
+            from_server = self.is_data_from_server()
+            if from_server:
+                # if data is reconstructed from payload
+                try:
+                    payload = self.received_payload.get(block=False)
+                    if payload is None:
+                        # end of epoch, also put None to signal the parent process
+                        self.data_queue.put(None)
+                        # we also need to close the record and open again in read me
+                        if self.cache is not None:
+                            self.cache.record.close()
+                            self.cache.record = BinaryBlob(
+                                self.cache.record.binary_file(),
+                                self.cache.record.index_file(),
+                                mode='r',
+                            )
+                    else:
+                        # payload contains the index of current minibatch too
+                        idx, payload = payload
+                        # otherwise, simply put the minibatch to data_queue
+                        self.data_queue.put(payload)
+                        # if caching, then write the minibatch
+                        if self.cache is not None:
+                            self.cache.record.write_index(idx, payload)
 
-        return minibatch
+                except queue.Empty:
+                    # we read without blocking so there's a chance that we have
+                    # nothing to read, sleep a bit
+                    await asyncio.sleep(0.001)
+            else:
+                # data is read from cache, this only happens when caching is enbaled
+                idx = self.cache.read_indices.pop(0)
+                minibatch = self.cache.record.read_index(idx)
+                self.data_queue.put((1, minibatch))
+                if len(self.cache.read_indices) == 0:
+                    self.cache.read_indices = shuffle_indices(
+                        0,
+                        self.total_minibatch,
+                        self.nearby_shuffle
+                    )
 
-class AsyncDataset(AsyncDataLoader):
-    def __init__(
-        self,
-        dataset_class,
-        dataset_params: dict,
-        nb_servers: int,
-        start_port: int=11111,
-        max_queue_size: int=20,
-        shuffle: bool=False,
-        device=None,
-        pin_memory=False,
-        packet_size=125000,
-        wait_time=10,
-        client_wait_time=10,
-        nb_retry=10,
-        gpu_indices=None,
-        qt_threading=False,
-        nearby_shuffle: int=0,
-        cache_setting=None,
-        rotation_setting=None,
-    ):
-        super().__init__(
-            dataset_class=dataset_class,
-            dataset_params=dataset_params,
-            nb_servers=nb_servers,
-            start_port=start_port,
-            batch_size=1,
-            max_queue_size=max_queue_size,
-            shuffle=shuffle,
-            device=device,
-            pin_memory=pin_memory,
-            packet_size=packet_size,
-            wait_time=wait_time,
-            client_wait_time=client_wait_time,
-            nb_retry=nb_retry,
-            gpu_indices=gpu_indices,
-            qt_threading=qt_threading,
-            nearby_shuffle=nearby_shuffle,
-            cache_setting=cache_setting,
-            rotation_setting=rotation_setting,
-        )
+            self.tasks.process_payload = await reSchedule(self.process_payload__)
+
+        except asyncio.CancelledError:
+            self.print_warning(
+                'process_payload__',
+                'got canceled',
+            )
+        except Exception as e:
+            await self.warn_and_exit('process_payload__', str(e))
+
+
+    @verbose
+    async def monitor_event__(self):
+        try:
+            if not self.event_queue.empty():
+                try:
+                    event = self.event_queue.get(block=False)
+                    if isinstance(event, dict):
+                        self.event_queue.put(event)
+                        await asyncio.sleep(5)
+                    elif event == 'close':
+                        # receive closing signal
+                        logger.info('monitor_event__: receive closing signal')
+                        await self.stop()
+                except queue.Empty:
+                    pass
+            await asyncio.sleep(0.01)
+            self.tasks.monitor_event = await reSchedule(self.monitor_event__)
+
+        except asyncio.CancelledError:
+            self.print_warning(
+                'monitor_event__',
+                'got canceled',
+            )
+        except Exception as e:
+            await self.warn_and_exit('monitor_event__', str(e))
+
+    @verbose
+    async def warn_and_exit(self, function_name, message):
+        self.event_queue.put({'status': 'failed'})
+        await super().warn_and_exit(function_name, message)

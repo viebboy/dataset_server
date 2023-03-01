@@ -26,6 +26,7 @@ import string
 import random
 import os
 import numpy as np
+import queue
 from queue import Queue
 import threading
 from loguru import logger
@@ -109,7 +110,7 @@ class AsyncDataLoader:
         pin_memory=False,
         packet_size=125000,
         wait_time=10,
-        client_wait_time=10,
+        retry_interval=10,
         nb_retry=10,
         gpu_indices=None,
         nearby_shuffle: int=0,
@@ -158,34 +159,27 @@ class AsyncDataLoader:
         self.is_client_available = False
 
         # start clients
-        self.start_clients(packet_size, client_wait_time, nb_retry)
+        client_params = {
+            'max_queue_size': max_queue_size,
+            'retry_interval': retry_interval,
+            'nearby_shuffle': nearby_shuffle,
+            'cache': self.cache,
+            'packet_size': packet_size,
+            'nb_retry': nb_retry,
+        }
+        self.start_clients(client_params)
         self.is_client_available = True
 
         # counter to track minibatch
         self.minibatch_count = 0
 
-        # start the thread to reconstruct data and put them into a queue
-        self.data_queue = Queue()
-        self.rotation_queue = Queue()
-        self.device = device
+        # event check frequency
+        self.event_check_counter = 100
 
-        # use python threading
-        self.fetcher_close_event = threading.Event()
-        self.data_thread = threading.Thread(
-            target=fetch_data,
-            args=(
-                self.clients,
-                self.data_queue,
-                self.rotation_queue,
-                max_queue_size,
-                self.fetcher_close_event,
-                pin_memory,
-                self.cache,
-                self.rotation,
-                nearby_shuffle,
-            )
-        )
-        self.data_thread.start()
+        # start the thread to reconstruct data and put them into a queue
+        self.device = device
+        self.pin_memory = pin_memory
+
         # wait a bit to generate some samples before returning
         logger.info(f'waiting {wait_time} seconds to preload some samples')
         time.sleep(wait_time)
@@ -243,11 +237,10 @@ class AsyncDataLoader:
                     raise RuntimeError('The directory of file_prefix ({prefix}) does not exist')
                 rotation.prefix = rotation_setting['prefix']
 
-            if side == 'client' and rotation.medium == 'disk' and self.cache is not None:
+            if side == 'client' and rotation.medium == 'disk':
                 msg = (
-                    'Caching on client side and rotation on disk can lead to unncessary overhead; ',
-                    'Consider using memory as rotation medium and caching on client; ',
-                    'Or using disk as rotation medium and no caching (or caching on server side);'
+                    'rotation on disk on client side is not supported; ',
+                    'consider using memory as rotation medium for client_rotation_setting',
                 )
                 raise RuntimeError(''.join(msg))
 
@@ -324,46 +317,71 @@ class AsyncDataLoader:
     def __exit__(self, *args):
         self.close()
 
-    def start_clients(self, packet_size, wait_time, nb_retry):
+    def start_clients(self, params):
         """
-        start the socket clients
+        start client processes
         """
         self.clients = []
-        self.sizes = []
-        self.total_minibatch = 0
         self.client_indices = []
+        self.data_queues = []
+        self.event_queues = []
+
 
         for index, port in enumerate(self.ports):
             logger.info(f'starting DatasetClient number {index} at port: {port}')
-            try:
-                new_client = DatasetClient(
-                    index=index,
-                    port=port,
-                    packet_size=packet_size,
-                    wait_time=wait_time,
-                    nb_retry=nb_retry,
-                )
-            except Exception as error:
-                self.close()
-                raise error
+            # construct parameters for client process
+            client_params = {key: value for key, value in params.items()}
+            client_params['client_index'] = index
+            client_params['port'] = port
 
-            self.clients.append(new_client)
-            self.sizes.append(len(new_client))
-            self.total_minibatch += len(new_client)
+            data_queue = CTX.Queue()
+            event_queue = CTX.Queue()
+            self.data_queues.append(data_queue)
+            self.event_queues.append(event_queue)
+            self.clients.append(ClientProcess(data_queue, event_queue, **client_params))
             self.client_indices.append(index)
 
-        self.nb_client = len(self.sizes)
+        self.nb_client = len(self.client_indices)
+
+        # start the clients
+        for client in self.clients:
+            client.start()
+
+        # now loop through event_queues to check if all processes are ready
+        logger.info('waiting for client processes to be ready...')
+        self.total_minibatch = 0
+        while True:
+            count = 0
+            for i in range(self.nb_client):
+                try:
+                    response = self.event_queues[i].get(block=False)
+                    if response['status'] == 'ready':
+                        count += 1
+                        self.total_minibatch += response['total_minibatch']
+                    elif response['status'] == 'failed':
+                        logger.warning('one of the client processes failed')
+                        logger.warning('force closing now...')
+                        self.force_close('one of the client processes failed')
+                except queue.Empty:
+                    time.sleep(1)
+            if count == self.nb_client:
+                break
+            else:
+                time.sleep(1)
+        logger.info('client processes are ready')
+
 
     def close(self):
         if not self.is_closed:
             logger.info('closing the AsyncDataLoader instance')
             # close the thread running DatasetClient
             if self.is_client_available:
-                self.fetcher_close_event.set()
-                self.data_thread.join()
+                # signal the client process to terminate
+                for i in range(self.nb_client):
+                    self.event_queues[i].put('close')
 
-                for client in self.clients:
-                    client.close()
+            for client in self.clients:
+                client.join()
 
             # close the dataset servers
             for server in self.servers:
@@ -376,6 +394,15 @@ class AsyncDataLoader:
 
             self.is_closed = True
             self.is_client_available = False
+
+    def force_close(self, message):
+        for server in self.servers:
+            server.kill()
+
+        for client in self.clients:
+            client.kill()
+
+        raise RuntimeError(message)
 
     def start_servers(
         self,
@@ -470,7 +497,6 @@ class AsyncDataLoader:
 
         return status_files
 
-
     def __len__(self):
         return max(1, self.rotation.max_rotation) * self.total_minibatch
 
@@ -482,46 +508,54 @@ class AsyncDataLoader:
             self.minibatch_count = 0
             raise StopIteration
 
+        if self.event_check_counter > 0:
+            self.event_check_counter -= 1
+        else:
+            self.event_check_counter = 100
+            for i in range(self.nb_client):
+                if not self.event_queues[i].empty():
+                    try:
+                        event = self.event_queues[i].get(block=False)
+                        if event['status'] == 'failed':
+                            logger.warning('one of the client processes failed')
+                            logger.warning('force closing now...')
+                            self.force_close('one of the client processes failed')
+                        else:
+                            raise RuntimeError(f'receive unknown event from client process: {event}')
+                    except queue.Empty:
+                        pass
+
         while True:
-            if self.rotation.max_rotation > 1:
-                # rotation is enabled
-                if (self.rotation_queue.qsize() >= self.rotation.min_size or self.minibatch_count > 0):
-                    # has some minimum elements
-                    readout = self.rotation_queue.get()
-                    if readout is None:
-                        error = self.rotation_queue.get()
-                        self.close()
-                        logger.warning(f'got error: {error}')
-                        raise RuntimeError(error)
-
-                    counter, minibatch = readout
-                    if counter < self.rotation.max_rotation:
-                        self.rotation_queue.put((counter+1, minibatch))
-                    break
-                else:
-                    time.sleep(0.001)
+            # read from data_queue
+            minibatch = self.data_queues[self.client_indices[0]].get()
+            if minibatch is None:
+                # this is the end of epoch from this client index
+                # remove this client index from the list
+                self.client_indices.pop(0)
+                if len(self.client_indices) == 0:
+                    self.client_indices = list(range(self.nb_client))
             else:
-                # no rotation, dont care about min rotation size
-                if not self.rotation_queue.empty():
-                    readout = self.rotation_queue.get()
-                    if readout is None:
-                        error = self.rotation_queue.get()
-                        self.close()
-                        logger.warning(f'got error: {error}')
-                        raise RuntimeError(error)
-
-                    counter, minibatch = readout
-                    break
-                else:
-                    time.sleep(0.001)
+                self.client_indices.append(self.client_indices.pop(0))
+                break
 
         # increase the minibatch counter
         self.minibatch_count += 1
+
+        if self.pin_memory:
+            minibatch = pin_data_memory(minibatch)
 
         if self.device is not None:
             minibatch = move_data_to_device(minibatch, device)
 
         return minibatch
+
+    def get_sample_without_rotation(self):
+        while True:
+            for i in self.client_indices:
+                try:
+                    minibatch = self.data_queues[i].get(block=False)
+                except queue.Empty:
+                    pass
 
 class AsyncDataset(AsyncDataLoader):
     def __init__(
