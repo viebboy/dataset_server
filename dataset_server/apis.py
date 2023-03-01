@@ -350,20 +350,25 @@ class AsyncDataLoader:
         # now loop through event_queues to check if all processes are ready
         logger.info('waiting for client processes to be ready...')
         self.total_minibatch = 0
+        status = [None for _ in range(self.nb_client)]
         while True:
             count = 0
             for i in range(self.nb_client):
-                try:
-                    response = self.event_queues[i].get(block=False)
-                    if response['status'] == 'ready':
-                        count += 1
-                        self.total_minibatch += response['total_minibatch']
-                    elif response['status'] == 'failed':
-                        logger.warning('one of the client processes failed')
-                        logger.warning('force closing now...')
-                        self.force_close('one of the client processes failed')
-                except queue.Empty:
-                    time.sleep(1)
+                if status[i] is None:
+                    try:
+                        response = self.event_queues[i].get(block=False)
+                        if response['status'] == 'ready':
+                            status[i] = 1
+                            count += 1
+                            self.total_minibatch += response['total_minibatch']
+                        elif response['status'] == 'failed':
+                            logger.warning('one of the client processes failed')
+                            logger.warning('force closing now...')
+                            self.force_close('one of the client processes failed')
+                    except queue.Empty:
+                        time.sleep(1)
+                else:
+                    count += 1
             if count == self.nb_client:
                 break
             else:
