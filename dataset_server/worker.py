@@ -1,6 +1,6 @@
 """
-processor.py: data processing implementation using async
---------------------------------------------------------
+worker.py: data processing implementation using async
+-----------------------------------------------------
 
 
 * Copyright: 2022 Dat Tran
@@ -125,28 +125,25 @@ class Dataloader(TaskThread):
         write_pipe,
         dataset_module_file,
         dataset_params_file,
+        nb_loader,
         loader_index,
         batch_size,
         max_queue_size,
         shuffle,
         nearby_shuffle,
-        name="Dataloader",
-        device=None,
+        name,
     ):
-        if os.path.exists(status_file) and os.path.isfile(status_file):
-            os.remove(status_file)
-
         self.shared_memory = shared_memory
+        self.max_shared_mem_size = len(shared_memory.buf)
         self.read_pipe = read_pipe
         self.write_pipe = write_pipe
         self.dataset_module_file = dataset_module_file
         self.dataset_params_file = dataset_params_file
-        self.server_index = loader_index
+        self.loader_index = loader_index
         self.batch_size = batch_size
         self.max_queue_size = max_queue_size
         self.shuffle = shuffle
         self.nearby_shuffle = nearby_shuffle
-        self.device = None if device is None else torch.device(device)
 
         super(Dataloader, self).__init__(parent = None, name=name)
 
@@ -155,11 +152,13 @@ class Dataloader(TaskThread):
         # locks
         self.locks.queue_index_changed = asyncio.Lock()
         self.locks.check_record = asyncio.Lock()
+        self.locks.change_send_status = asyncio.Lock()
 
         # list of tasks
         self.tasks.generate_sample_without_rotation = None
         self.tasks.generate_sample_with_rotation = None
         self.tasks.generate_minibatch = None
+        self.tasks.check_parent_message = None
         self.tasks.start_batching = None
         self.tasks.rotate_data_on_disk = None
         self.tasks.rotate_data_on_memory = None
@@ -177,6 +176,10 @@ class Dataloader(TaskThread):
         self.current_minibatch = [[]]
         self.batcher_created = False
 
+        # flags to keep track of shared memory
+        # initially false because we need to check response from parent
+        self.can_send = False
+
 
     @verbose
     async def enter__(self):
@@ -191,22 +194,8 @@ class Dataloader(TaskThread):
         """
         try:
             # move the current minibatch into sample_queue for batching
-            # start generate minibatch task
             # reset the current minibatch
             self.sample_queue.put(self.current_minibatch.pop(0))
-            # launch the task to perform batching and send it to children
-            if not self.batcher_created:
-                self.tasks.generate_minibatch = await reCreate(
-                    self.tasks.generate_minibatch,
-                    self.generate_minibatch__
-                )
-
-                self.batcher_created = True
-            else:
-                # schedule the task to run
-                self.tasks.generate_minibatch = await reSchedule(
-                    self.generate_minibatch__
-                )
 
             # reset
             self.current_minibatch = [[]]
@@ -224,15 +213,68 @@ class Dataloader(TaskThread):
     async def generate_minibatch__(self):
         # batching the samples and send to children
         try:
-            if not self.sample_queue.empty():
+            if not self.sample_queue.empty() and self.can_send:
                 samples = self.sample_queue.get()
-                minibatch = concatenate_list(samples, self.device)
-                self.minibatch_queue.put(minibatch)
+                minibatch = concatenate_list(samples)
+                minibatch = dill.dumps(minibatch)
+                if len(minibatch) > self.max_shared_mem_size:
+                    await self.warn_and_exit(
+                        'generate_minibatch__',
+                        'got a minibatch that is bigger than shared memory space'
+                    )
+                else:
+                    # put bytes into shared_memory
+                    self.shared_memory.buf[:len(minibatch)] = minibatch
+                    # then send the number of bytes to read
+                    self.write_pipe.send(
+                        {
+                            'title': 'minibatch_length',
+                            'content': len(minibatch),
+                        }
+                    )
+
+                    # change the send status
+                    async with self.locks.change_send_status:
+                        self.can_send = False
+            else:
+                await asyncio.sleep(0.001)
+
+            self.tasks.generate_minibatch = await reSchedule(self.generate_minibatch__)
+
         except asyncio.CancelledError:
             self.print_warning('generate_minibatch__', 'got canceled')
         except Exception as e:
             await self.warn_and_exit(
                 'generate_minibatch__',
+                str(e)
+            )
+
+
+    @verbose
+    async def check_parent_message__(self):
+        """
+        check the message from parent process through pipe
+        """
+        try:
+            if self.read_pipe.poll():
+                response = self.read_pipe.recv()
+                if response == 'can_send':
+                    async with self.locks.change_send_status:
+                        self.can_send = True
+                elif response == 'close':
+                    # receive close signal
+                    logger.info(f'receive close signal from parent process; closing now...')
+                    await self.clean_and_exit()
+            else:
+                await asyncio.sleep(0.001)
+
+            self.tasks.check_parent_message = await reSchedule(self.check_parent_message__)
+
+        except asyncio.CancelledError:
+            self.print_warning('check_parent_message__', 'got canceled')
+        except Exception as e:
+            await self.warn_and_exit(
+                'check_parent_message__',
                 str(e)
             )
 
@@ -430,7 +472,7 @@ class Dataloader(TaskThread):
 
                 # compute the maximum number of minibatches that we can
                 # generate based on max_queue_size
-                max_minibatch = max(1, self.max_queue_size - self.minibatch_queue.qsize())
+                max_minibatch = max(1, self.max_queue_size - self.sample_queue.qsize())
                 minibatch_count = 0
                 # loop through the leftover indices and read from record
                 for _ in range(len(self.rotation.disk.indices_to_read)):
@@ -524,20 +566,6 @@ class Dataloader(TaskThread):
                         # batch these leftover samples
                         await self.start_batching()
 
-            # check if whether the numbef of minibatches to be sent is too much
-            # mn_counter is a proxy counter to reduce the time we check
-            # minibatch_queue
-            """
-            if self.rotation.mb_counter > 0:
-                is_full = False
-                self.rotation.mb_counter -= 1
-            else:
-                self.rotation.mb_counter = self.rotation.mb_max_size
-                if self.minibatch_queue.qsize() > self.max_queue_size:
-                    is_full = True
-                else:
-                    is_full = False
-            """
             is_full = self.is_sample_queue_full()
 
             # check if the read_queue has minimum size to start reading
@@ -851,16 +879,45 @@ class Dataloader(TaskThread):
                 str(e)
             )
 
-
     @verbose
     async def warn_and_exit(self, function_name, warning):
+        # clean up cacche
         if self.cache is not None:
             self.cache.record.close()
+
+        # clean up rotation
         if self.rotation.medium == 'disk':
             self.rotation.records[0].close()
             self.rotation.records[1].close()
 
+        # close shared memory
+        self.shared_memory.close()
+
+        # close the write pipe
+        self.write_pipe.send({'title': 'close_with_error', 'content': warning})
+        self.write_pipe.close()
+
         await super().warn_and_exit(function_name, warning)
+
+    @verbose
+    async def clean_and_exit(self, function_name, warning):
+        # clean up cacche
+        if self.cache is not None:
+            self.cache.record.close()
+
+        # clean up rotation
+        if self.rotation.medium == 'disk':
+            self.rotation.records[0].close()
+            self.rotation.records[1].close()
+
+        # close shared memory
+        self.shared_memory.close()
+
+        # close the write pipe
+        self.write_pipe.close()
+
+        # then stop everything
+        await self.stop()
 
 
     @verbose
@@ -910,79 +967,76 @@ class Dataloader(TaskThread):
             # handle caching
             if cache_setting is not None:
                 self.cache = Property()
-                self.cache.bin_file = cache_setting['prefix'] + '{:09d}.bin'.format(self.server_index)
-                self.cache.idx_file = cache_setting['prefix'] + '{:09d}.idx'.format(self.server_index)
+                self.cache.bin_file = cache_setting['prefix'] + '{:09d}.bin'.format(self.loader_index)
+                self.cache.idx_file = cache_setting['prefix'] + '{:09d}.idx'.format(self.loader_index)
                 self.cache.record = BinaryBlob(self.cache.bin_file, self.cache.idx_file, mode='w')
 
                 # if update frequency = K --> the cache files are rewritten
                 # every K epochs
                 self.cache.update_freq = cache_setting['update_frequency']
-                if self.cache.update_freq < 2:
-                    await self.warn_and_exit(
-                        'load_dataset__',
-                        f'cache update frequency must be at least 2, received: {self.cache.update_freq}'
-                    )
             else:
                 self.cache = None
 
             # handle rotation
             self.rotation = Property()
-            if rotation_setting is None:
-                self.rotation.max_rotation = 1
-                self.rotation.min_size = 1
-                self.rotation.max_size = max(1, self.max_queue_size) * self.batch_size
-                self.rotation.medium = None
+            self.rotation.medium = rotation_setting['medium']
+            self.rotation.max_rotation = rotation_setting['rotation']
+            self.rotation.min_size = self.batch_size + 1
+            if self.rotation_medium == 'memory':
+                self.rotation.max_size = self.batch_size * self.max_queue_size
             else:
-                self.rotation.medium = rotation_setting['medium']
-                self.rotation.max_rotation = rotation_setting['rotation']
-                self.rotation.min_size = rotation_setting['min_rotation_size']
-                self.rotation.max_size = rotation_setting['max_rotation_size']
-                if self.rotation.medium == 'disk':
-                    self.rotation.prefix = rotation_setting['prefix']
-                    part_a = BinaryBlob(
-                        self.rotation.prefix + f'_{self.server_index}_A.bin',
-                        self.rotation.prefix + f'_{self.server_index}_A.idx',
-                        mode='w',
-                    )
-                    part_b = BinaryBlob(
-                        self.rotation.prefix + f'_{self.server_index}_B.bin',
-                        self.rotation.prefix + f'_{self.server_index}_B.idx',
-                        mode='w',
-                    )
-                    self.rotation.records = [part_a, part_b]
-                    # create counters for samples on disk
-                    self.rotation.disk = Property()
-                    self.rotation.disk.sample_write_idx = 0
-                    self.rotation.disk.sample_counter = 0
-                    self.rotation.disk.current_round = 0
-                    self.rotation.disk.indices_to_read = []
-                    self.rotation.disk.indices_to_ignore_list = [[]]
-                    self.rotation.disk.indices_to_ignore = Queue()
+                self.rotation.max_size = rotation_setting['size']
 
+            if self.rotation.medium == 'disk':
+                self.rotation.prefix = rotation_setting['prefix']
+                part_a = BinaryBlob(
+                    self.rotation.prefix + f'_{self.loader_index}_A.bin',
+                    self.rotation.prefix + f'_{self.loader_index}_A.idx',
+                    mode='w',
+                )
+                part_b = BinaryBlob(
+                    self.rotation.prefix + f'_{self.loader_index}_B.bin',
+                    self.rotation.prefix + f'_{self.loader_index}_B.idx',
+                    mode='w',
+                )
+                self.rotation.records = [part_a, part_b]
+                # create counters for samples on disk
+                self.rotation.disk = Property()
+                self.rotation.disk.sample_write_idx = 0
+                self.rotation.disk.sample_counter = 0
+                self.rotation.disk.current_round = 0
+                self.rotation.disk.indices_to_read = []
+                self.rotation.disk.indices_to_ignore_list = [[]]
+                self.rotation.disk.indices_to_ignore = Queue()
 
-            sample_per_server = math.ceil(len(self.dataset) / self.total_server)
-            start_idx = self.server_index * sample_per_server
-            stop_idx = min(len(self.dataset), (self.server_index + 1) * sample_per_server)
+            sample_per_loader = math.ceil(len(self.dataset) / self.nb_loader)
+            start_idx = self.loader_index * sample_per_loader
+            stop_idx = min(len(self.dataset), (self.loader_index + 1) * sample_per_loader)
             self.total_sample = stop_idx - start_idx
-            self.indices = shuffle_indices(start_idx, stop_idx, self.nearby_shuffle)
 
-            nb_mini_batch = int(np.ceil(self.total_sample * self.rotation.max_rotation / self.batch_size))
-            self.dataset_length.put(nb_mini_batch)
+            # create a list of indices for reading from dataset
+            if self.shuffle:
+                self.indices = shuffle_indices(start_idx, stop_idx, self.nearby_shuffle)
+            else:
+                self.indices = list(range(start_idx, stop_idx))
 
+            self.total_minibatch = int(np.ceil(self.total_sample * self.rotation.max_rotation / self.batch_size))
+
+            self.write_pipe.send({'title': 'readiness', 'content': True})
             logger.info('completes loading dataset')
 
             # start the task to prefetch samples
-            if self.rotation.medium in [None, 'memory']:
+            if self.rotation.medium == 'memory':
                 # perform initialization for this case
                 # we need 2 queues to correctly rotate data between epochs
                 # without mixing them
                 self.rotation.queue = [Queue(), Queue()]
                 # this is to keep track of the queue size
-                self.rotation.queue_max_size = self.rotation.max_size
-                self.rotation.queue_counter = self.rotation.max_size
+                self.rotation.queue_max_size = max(1, int(0.5 * self.max_queue_size)) * self.batch_size
+                self.rotation.queue_counter = max(1, int(0.5 * self.max_queue_size)) * self.batch_size
                 # this is to keep track of the number of minibatches
-                self.rotation.mb_max_size = max(1, self.max_queue_size) * self.batch_size
-                self.rotation.mb_counter = max(1, self.max_queue_size) * self.batch_size
+                self.rotation.mb_max_size = self.max_queue_size * self.batch_size
+                self.rotation.mb_counter = self.max_queue_size * self.batch_size
                 # there are 2 queues, read and write queue
                 # these are counters for read queue
                 self.rotation.read_queue_idx = 0
@@ -1022,8 +1076,8 @@ class Dataloader(TaskThread):
                 # written to a binary blob
 
                 # this is to keep track of the queue size
-                self.rotation.queue_max_size = max(1, self.max_queue_size) * self.batch_size
-                self.rotation.queue_counter = max(1, self.max_queue_size) * self.batch_size
+                self.rotation.queue_max_size = max(1, int(0.5 * self.max_queue_size)) * self.batch_size
+                self.rotation.queue_counter = max(1, int(0.5 * self.max_queue_size)) * self.batch_size
 
                 # this is to keep track of the number of minibatches
                 self.rotation.mb_max_size = max(1, self.max_queue_size) * self.batch_size
@@ -1060,6 +1114,11 @@ class Dataloader(TaskThread):
                 self.generate_minibatch__
             )
 
+            self.tasks.check_parent_message = await reCreate(
+                self.tasks.check_parent_message,
+                self.check_parent_message__
+            )
+
         except asyncio.CancelledError:
             self.print_warning('load_dataset__', 'got canceled')
         except Exception as e:
@@ -1078,6 +1137,9 @@ class Dataloader(TaskThread):
         self.tasks.generate_minibatch = await delete(
             self.tasks.generate_minibatch
         )
+        self.tasks.check_parent_message = await delete(
+            self.tasks.check_parent_message
+        )
         self.tasks.rotate_data_on_disk = await delete(
             self.tasks.rotate_data_on_disk
         )
@@ -1090,29 +1152,3 @@ class Dataloader(TaskThread):
         self.tasks.start_batching = await delete(
             self.tasks.start_batching
         )
-
-
-    @verbose
-    async def new_connection_handler__(self, reader, writer):
-        """
-        handle a new connection
-        """
-        logger.info(f"new_connection_handler__ : new connection for {self.getInfo()}")
-
-        if len(self.children) > self.max_clients:
-            logger.warning(
-                f"new_connection_handler__ : max number of connections is {self.max_clients}"
-            )
-            return
-
-        child_connection = ServerConnectionHandler(
-            minibatch_queue=self.minibatch_queue,
-            dataset_length=self.dataset_length,
-            reader=reader,
-            writer=writer,
-            parent=self,
-            packet_size=self.packet_size,
-            name=self.name,
-        )
-        await child_connection.run()
-        await self.addChild(child_connection)
