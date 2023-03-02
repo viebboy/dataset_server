@@ -115,6 +115,7 @@ class Worker(CTX.Process):
             'nearby_shuffle',
             'max_minibatch_length',
             'nb_loader',
+            'gpu_index',
         ]
 
         for key in keys:
@@ -127,6 +128,10 @@ class Worker(CTX.Process):
         return self._front_write_pipe
 
     def run(self):
+        import os
+        if self.kwargs['gpu_index'] is not None:
+            os.environ['CUDA_VISIBLE_DEVICES'] = str(self.kwargs['gpu_index'])
+
         from dataset_server.worker import DatasetLoader
         import asyncio
 
@@ -435,6 +440,7 @@ class DataLoader:
                 'max_minibatch_length': max_minibatch_length,
                 'nb_loader': nb_worker,
                 'nb_minibatch': worker_len[i],
+                'gpu_index': gpu_indices[i] if gpu_indices is not None else None,
             }
             worker = Worker(name, **params)
             worker.start()
