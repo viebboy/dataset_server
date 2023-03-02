@@ -105,6 +105,9 @@ class DatasetClient(TaskThread):
         # counter to check whether payload queue is full
         self.read_socket_counter = self.max_queue_size
 
+        self.fps_count= 0
+        self.start_time = None
+
         # initialize counter for cache
         if self.cache is not None:
             self.cache.current_epoch = 0
@@ -321,6 +324,16 @@ class DatasetClient(TaskThread):
                     )
                 else:
                     # put reconstructed objects into a queue
+                    if self.start_time is None:
+                        self.start_time = time.time()
+                    self.fps_count += 1
+                    if self.fps_count == 100:
+                        duration = time.time() - self.start_time
+                        latency = duration / 100
+                        logger.info('it took {:.4f} seconds to reconstruct 1 minibatch'.format(latency))
+                        self.fps_count = 0
+                        self.start_time = time.time()
+
                     self.received_payload.put((self.minibatch_idx, payload))
                     self.minibatch_idx += 1
                     if self.minibatch_idx == self.total_minibatch:

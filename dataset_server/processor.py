@@ -1,6 +1,6 @@
 """
-server.py: server implementation for dataloader via socket
-----------------------------------------------------------
+processor.py: data processing implementation using async
+--------------------------------------------------------
 
 
 * Copyright: 2022 Dat Tran
@@ -114,329 +114,49 @@ def concatenate_list(inputs, device=None):
     return _concatenate_item(outputs)
 
 
-class ServerConnectionHandler(TaskThread):
+class Dataloader(TaskThread):
     """
-    This TaskThread is used to handle whenever a new client is connected to the server
-    """
-    def __init__(
-        self,
-        minibatch_queue,
-        dataset_length,
-        parent = None,
-        reader = None,
-        writer = None,
-        packet_size = 125000,
-        name='ServerConnectionHandler'
-    ):
-        # max buffer is the number of samples that could stay in the stream
-        # buffer
-        self.minibatch_queue = minibatch_queue
-        self.dataset_length = dataset_length
-        self.reader = reader
-        self.writer = writer
-        self.packet_size = packet_size
-        super(ServerConnectionHandler, self).__init__(parent = parent, name=name)
-
-    def initVars__(self):
-        """
-        register the basic tasks here
-        """
-        self.tasks.read_socket = None
-        self.tasks.write_socket = None
-        self.tasks.send_minibatch = None
-        self.tasks.monitor_response = None
-        self.tasks.send_dataset_info = None
-        self.obj_queue = Queue()
-        self.reset_read_package_state__(True)
-
-        # variable for latency benchmarking
-        self.total_sent = 0
-        self.start_time = None
-
-        # variable to keep track of the stream flushing
-        self.is_flushed = False
-        self.sender_task_created = False
-
-    @verbose
-    async def send_minibatch__(self):
-        try:
-            if not self.minibatch_queue.empty() and self.is_flushed:
-                minibatch = self.minibatch_queue.get()
-                await self.write_socket__(minibatch)
-                self.is_flushed = False
-
-            # reschedule the task
-            await asyncio.sleep(0.001)
-            self.tasks.send_minibatch = await reSchedule(self.send_minibatch__)
-
-        except asyncio.CancelledError:
-            self.print_warning('send_minibatch__', 'got canceled')
-        except Exception as e:
-            await self.warn_and_exit(
-                'send_minibatch__',
-                str(e)
-            )
-
-    @verbose
-    async def send_dataset_info__(self):
-        try:
-            if not self.dataset_length.empty():
-                length = self.dataset_length.get()
-                await self.write_socket__(length)
-                logger.info('complete writing dataset length')
-
-                # launch the monitor response task
-                self.tasks.monitor_response = await reCreate(
-                    self.tasks.monitor_response,
-                    self.monitor_response__
-                )
-            else:
-                # dataset has not been loaded
-                # reschedule this task until dataset length is available
-                await asyncio.sleep(1)
-                self.tasks.send_dataset_info = await reSchedule(
-                    self.send_dataset_info__
-                )
-        except asyncio.CancelledError:
-            self.print_warning('send_dataset_info__', 'got canceled')
-        except Exception as e:
-            await self.warn_and_exit('send_dataset_info__', str(e))
-
-    @verbose
-    async def monitor_response__(self):
-        try:
-            if not self.obj_queue.empty():
-                response = self.obj_queue.get()
-                # handle response after sending a mini-batch
-                if response == 'ok':
-                    self.is_flushed = True
-                    if self.start_time is None:
-                        self.start_time = time.time()
-                    self.total_sent += 1
-
-                    if self.total_sent == 100:
-                        duration = time.time() - self.start_time
-                        latency = duration / 100
-                        msg = (
-                            'it took {:.4f} seconds to send 1 minibatch, '.format(latency),
-                            f'queue size: {self.minibatch_queue.qsize()}'
-                        )
-                        logger.info(''.join(msg))
-                        self.start_time = time.time()
-                        self.total_sent = 0
-
-                    if not self.sender_task_created:
-                        self.sender_task_created = True
-                        self.tasks.send_minibatch = await reCreate(
-                            self.tasks.send_minibatch,
-                            self.send_minibatch__
-                        )
-                else:
-                    await self.warn_and_exit(
-                        'monitor_response__',
-                        f'Unknown response: {response}'
-                    )
-
-            # sleep a bit then reschedule
-            await asyncio.sleep(0.001)
-            self.tasks.monitor_response = await reSchedule(self.monitor_response__)
-
-        except asyncio.CancelledError:
-            self.print_warning('monitor_response__', 'got canceled')
-        except Exception as e:
-            await self.warn_and_exit(
-                'monitor_response__',
-                str(e)
-            )
-
-    @verbose
-    async def enter__(self):
-        """
-        read_socket() and write_socket() are not created in initialization
-        """
-        logger.info(f"enter__ : {self.getInfo()}")
-
-        # launch task to read from socket
-        self.tasks.read_socket = await reCreate(
-            self.tasks.read_socket,
-            self.read_socket__
-        )
-
-        self.tasks.send_dataset_info = await reCreate(
-            self.tasks.send_dataset_info,
-            self.send_dataset_info__
-        )
-
-
-    @verbose
-    async def exit__(self):
-        self.tasks.read_socket = await delete(self.tasks.read_socket)
-        self.tasks.write_socket = await delete(self.tasks.write_socket)
-        self.tasks.send_minibatch = await delete(self.tasks.send_minibatch)
-        self.tasks.monitor_response = await delete(self.tasks.monitor_response)
-        self.tasks.send_dataset_info = await delete(self.tasks.send_dataset_info)
-        try:
-            self.writer.close()
-            await self.writer.wait_closed()
-        except Exception as e:
-            logger.warning(f'Failed to close StreamWriter with this error: {e}')
-        logger.debug("exit__: bye!")
-
-    async def read_socket__(self):
-        try:
-            try:
-                packet = await self.reader.read(self.packet_size)
-                """a word of warning here: try to tread as much bytes as you can with the
-                asyncio StreamReader instance (here self.reader) per re-scheduling,
-                in order to keep the rescheduling frequency reasonable
-                """
-            except Exception as e:
-                await self.warn_and_exit('read_socket__', str(e))
-            else:
-                if len(packet) > 0:
-                    # all good!  keep on reading = reschedule this
-                    # send the payload to parent:
-                    await self.handle_read_packet__(packet)
-                    """you can re-schedule with a moderate frequency, say, 100 times per second,
-                    but try to keep the re-scheduling frequency "sane"
-                    """
-                    self.tasks.read_socket = await reSchedule(self.read_socket__); return
-                else:
-                    await self.warn_and_exit('read_socket__', 'client has stopped the connection')
-
-        except asyncio.CancelledError:
-            self.print_warning('read_socket__', 'got canceled')
-
-        except Exception as e:
-            await self.warn_and_exit('read_socket__', str(e))
-
-    def reset_read_package_state__(self, clearbuf = False):
-        self.left = INTERCOM_HEADER_LEN
-        self.obj_len = 0
-        self.header = True
-        if clearbuf:
-            self.read_buf = bytes(0)
-
-    async def handle_read_packet__(self, packet):
-        """packet reconstructions into blobs of certain length
-        """
-        if packet is not None:
-            self.read_buf += packet
-        if self.header:
-            if len(self.read_buf) >= INTERCOM_HEADER_LEN:
-                self.obj_len = int.from_bytes(self.read_buf[0:INTERCOM_HEADER_LEN], "big")
-                self.header = False # we got the header info (length)
-                if len(self.read_buf) > INTERCOM_HEADER_LEN:
-                    # sort out the remaining stuff
-                    await self.handle_read_packet__(None)
-        else:
-            if len(self.read_buf) >= (INTERCOM_HEADER_LEN + self.obj_len):
-                # correct amount of bytes have been obtained
-                payload = bytes_to_object(
-                    self.read_buf[INTERCOM_HEADER_LEN:INTERCOM_HEADER_LEN + self.obj_len]
-                )
-                # put reconstructed objects into a queue
-                self.obj_queue.put(payload)
-                # prepare state for next blob
-                if len(self.read_buf) > (INTERCOM_HEADER_LEN + self.obj_len):
-                    # there's some leftover here for the next blob..
-                    self.read_buf = self.read_buf[INTERCOM_HEADER_LEN + self.obj_len:]
-                    self.reset_read_package_state__()
-                    # .. so let's handle that leftover
-                    await self.handle_read_packet__(None)
-                else:
-                    # blob ends exactly
-                    self.reset_read_package_state__(clearbuf=True)
-
-    async def write_socket__(self, obj=None):
-        """
-        Send an object to the client
-        """
-        try:
-            # sequentially write a block of self.packet_size bytes
-            if obj is not None:
-                # convert to byte array
-                self.write_buf = object_to_bytes(obj)
-                self.write_start = 0
-                # then reschedule to call this task again
-                self.tasks.write_socket = await reSchedule(self.write_socket__)
-                return
-            else:
-                # this part is the actual writing part
-                # we will write one blob of self.packet_size at a time
-                # and allow returning the control to the main loop if needed
-                if self.write_start < len(self.write_buf):
-                    write_stop = min(len(self.write_buf), self.write_start + self.packet_size)
-                    try:
-                        self.writer.write(self.write_buf[self.write_start:write_stop])
-                        await self.writer.drain()
-                    except Exception as e:
-                        logger.warning(f"write_socket__ : sending to client failed : {e}")
-                        logger.info(f"write_socket__: tcp connection {self.getInfo()} terminated")
-                        await self.stop()
-                    else:
-                        self.write_start = write_stop
-                        self.tasks.write_socket = await reSchedule(self.write_socket__); return
-                else:
-                    return
-        except asyncio.CancelledError:
-            self.print_warning('write_socket__', 'got canceled')
-        except Exception as e:
-            await self.warn_and_exit('write_socket__', str(e))
-
-
-class DataloaderServer(TaskThread):
-    """
-    DataServer class
+    Dataloader class
     """
     def __init__(
         self,
-        status_file,
+        shared_memory,
+        read_pipe,
+        write_pipe,
         dataset_module_file,
         dataset_params_file,
-        total_server,
-        server_index,
+        loader_index,
         batch_size,
         max_queue_size,
         shuffle,
         nearby_shuffle,
-        name="DataloaderServer",
-        retry_interval=5,
-        port=5002,
-        max_clients=1,
+        name="Dataloader",
         device=None,
-        packet_size=125000,
     ):
         if os.path.exists(status_file) and os.path.isfile(status_file):
             os.remove(status_file)
 
-        self.status_file = status_file
+        self.shared_memory = shared_memory
+        self.read_pipe = read_pipe
+        self.write_pipe = write_pipe
         self.dataset_module_file = dataset_module_file
         self.dataset_params_file = dataset_params_file
-        self.total_server = total_server
-        self.server_index = server_index
+        self.server_index = loader_index
         self.batch_size = batch_size
         self.max_queue_size = max_queue_size
         self.shuffle = shuffle
         self.nearby_shuffle = nearby_shuffle
-        self.retry_interval = retry_interval
-        self.port = port
-        self.max_clients = max_clients
         self.device = None if device is None else torch.device(device)
-        self.packet_size = packet_size
 
-        super(DataloaderServer, self).__init__(parent = None, name=name)
+        super(Dataloader, self).__init__(parent = None, name=name)
 
 
     def initVars__(self):
-        self.server = None
-        self.server_started = False
         # locks
         self.locks.queue_index_changed = asyncio.Lock()
         self.locks.check_record = asyncio.Lock()
 
         # list of tasks
-        self.tasks.tcp_server = None
         self.tasks.generate_sample_without_rotation = None
         self.tasks.generate_sample_with_rotation = None
         self.tasks.generate_minibatch = None
@@ -445,8 +165,6 @@ class DataloaderServer(TaskThread):
         self.tasks.rotate_data_on_memory = None
         self.tasks.cache_rotation = None
         self.tasks.load_dataset = None
-
-        self.dataset_length = Queue()
 
         # this holds lists of samples to be concatenated
         self.sample_queue = Queue()
@@ -462,7 +180,6 @@ class DataloaderServer(TaskThread):
 
     @verbose
     async def enter__(self):
-        self.tasks.tcp_server = await reCreate(self.tasks.tcp_server, self.tcp_server__)
         self.tasks.load_dataset = await reCreate(self.tasks.load_dataset, self.load_dataset__)
 
     @verbose
@@ -555,7 +272,7 @@ class DataloaderServer(TaskThread):
                         # if 1st record is also in write mode and
                         # minibatch_queue is not full, we need to put data in
                         # current_minibatch[0] and perform batching
-                        need_batching = not self.is_minibatch_queue_full()
+                        need_batching = not self.is_sample_queue_full()
                     else:
                         need_batching = False
                 else:
@@ -656,20 +373,8 @@ class DataloaderServer(TaskThread):
                 str(e)
             )
 
-    def is_minibatch_queue_full(self):
-        # check if whether the numbef of minibatches to be sent is too much
-        """
-        if self.rotation.mb_counter > 0:
-            is_full = False
-            self.rotation.mb_counter -= 1
-        else:
-            self.rotation.mb_counter = self.rotation.mb_max_size
-            if self.minibatch_queue.qsize() > self.max_queue_size:
-                is_full = True
-            else:
-                is_full = False
-        """
-        if self.minibatch_queue.qsize() > self.max_queue_size:
+    def is_sample_queue_full(self):
+        if self.sample_queue.qsize() > self.max_queue_size:
             is_full = True
         else:
             is_full = False
@@ -697,7 +402,7 @@ class DataloaderServer(TaskThread):
                     can_read = True
                 else:
                     can_read = False
-                is_full = self.is_minibatch_queue_full()
+                is_full = self.is_sample_queue_full()
 
             if not can_read:
                 await asyncio.sleep(0.01)
@@ -833,7 +538,7 @@ class DataloaderServer(TaskThread):
                 else:
                     is_full = False
             """
-            is_full = self.is_minibatch_queue_full()
+            is_full = self.is_sample_queue_full()
 
             # check if the read_queue has minimum size to start reading
             # this is because when we read a sample, we will put it back to the
@@ -1177,7 +882,7 @@ class DataloaderServer(TaskThread):
                 msg = (
                     f'name clashing: the dataset module file: {self.dataset_module_file} ',
                     f'has module name = {module_name}, which clashes with one of sys.modules. ',
-                    f'the dataset server might fail to load dataset because dependent modules are not loaded',
+                    f'the dataset loader might fail to load dataset because dependent modules are not loaded',
                 )
                 logger.warning(''.join(msg))
                 logger.warning(f'sys.modules contain the following modules: {sys.modules.keys()}')
@@ -1203,7 +908,7 @@ class DataloaderServer(TaskThread):
             self.dataset = constructor(**params)
 
             # handle caching
-            if cache_setting is not None and cache_setting['side'] == 'server':
+            if cache_setting is not None:
                 self.cache = Property()
                 self.cache.bin_file = cache_setting['prefix'] + '{:09d}.bin'.format(self.server_index)
                 self.cache.idx_file = cache_setting['prefix'] + '{:09d}.idx'.format(self.server_index)
@@ -1264,13 +969,7 @@ class DataloaderServer(TaskThread):
             nb_mini_batch = int(np.ceil(self.total_sample * self.rotation.max_rotation / self.batch_size))
             self.dataset_length.put(nb_mini_batch)
 
-            while not self.server_started:
-                await asyncio.sleep(0.1)
-
-            with open(self.status_file, 'w') as fid:
-                fid.write('ready')
-
-            logger.info('server completes loading dataset')
+            logger.info('completes loading dataset')
 
             # start the task to prefetch samples
             if self.rotation.medium in [None, 'memory']:
@@ -1368,7 +1067,6 @@ class DataloaderServer(TaskThread):
 
     @verbose
     async def exit__(self):
-        self.tasks.tcp_server = await delete(self.tasks.tcp_server)
         self.tasks.load_dataset = await delete(self.tasks.load_dataset)
 
         self.tasks.generate_sample_with_rotation = await delete(
@@ -1393,29 +1091,6 @@ class DataloaderServer(TaskThread):
             self.tasks.start_batching
         )
 
-    @verbose
-    async def tcp_server__(self):
-        """
-        This handle a new connection by creating a ServerConnectionHandler task
-        """
-        try:
-            logger.info(f'{self.getInfo()}: server starting at port {self.port}')
-            self.server = await asyncio.start_server(self.new_connection_handler__, "", self.port)
-
-        except asyncio.CancelledError:
-            self.print_warning('tcp_server__', 'got canceled')
-            self.server = None
-            self.server_started = False
-
-        except Exception as e:
-            logger.warning(f"tcp_server__: failed with {e}")
-            logger.warning(f"tcp_server__: will try again in {self.retry_interval} secs")
-            await asyncio.sleep(self.retry_interval)
-            self.server_started = False
-            self.tasks.tcp_server = await reSchedule(self.tcp_server__)
-        else:
-            logger.info("tcp_server__ : new server waiting")
-            self.server_started = True
 
     @verbose
     async def new_connection_handler__(self, reader, writer):
