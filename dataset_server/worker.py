@@ -236,7 +236,6 @@ class DatasetLoader(TaskThread):
                             'content': len(minibatch),
                         }
                     )
-                    self.total_sent += 1
 
                     # change the send status
                     async with self.locks.change_send_status:
@@ -266,8 +265,12 @@ class DatasetLoader(TaskThread):
             if self.read_pipe.poll():
                 response = self.read_pipe.recv()
                 if response == 'can_send':
+
                     if self.total_sent == 0:
                         self.start_time = time.time()
+                    else:
+                        self.total_sent += 1
+
                     if self.total_sent == 100:
                         duration = time.time() - self.start_time
                         self.start_time = time.time()
@@ -280,6 +283,7 @@ class DatasetLoader(TaskThread):
                             logger.debug(f'rotation.queue[1] size: {self.rotation.queue[1].qsize()}')
                         else:
                             logger.debug(f'rotation.queue size: {self.rotation.queue.qsize()}')
+
 
                     async with self.locks.change_send_status:
                         self.can_send = True
@@ -339,7 +343,10 @@ class DatasetLoader(TaskThread):
                         # if 1st record is also in write mode and
                         # minibatch_queue is not full, we need to put data in
                         # current_minibatch[0] and perform batching
-                        need_batching = not self.is_sample_queue_full()
+                        if self.sample_queue.qsize() > self.max_queue_size:
+                            need_batching = False
+                        else:
+                            need_batching = True
                     else:
                         need_batching = False
                 else:
@@ -664,11 +671,12 @@ class DatasetLoader(TaskThread):
             return
 
         try:
-            # check if whether the queue is too full
-            if self.rotation.queue.qsize() > self.rotation.queue_max_size:
-                is_full = True
-            else:
-                is_full = False
+            # if the record is still in writing mode, keep generating samples
+            async with self.locks.check_record:
+                if self.rotation.records[1].mode() == 'write':
+                    is_full = False
+                else:
+                    is_full = True
 
             if not is_full:
                 # check whether sample is read from dataset or from cache
