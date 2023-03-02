@@ -304,6 +304,7 @@ class DataLoader:
         self.dataset_len = dataset_len
         self.worker_len = worker_len
         self.minibatch_count = 0
+        self.latency_counter = None
         self.indices_to_process = list(range(nb_worker))
 
         if prefetch_time is not None and prefetch_time > 0:
@@ -528,6 +529,10 @@ class DataLoader:
             self.minibatch_count = 0
             raise StopIteration
 
+        if self.latency_counter is None:
+            self.latency_counter = 0
+            self.start_time = time.time()
+
         minibatch = None
         while minibatch is None:
             for i in self.indices_to_process:
@@ -560,6 +565,14 @@ class DataLoader:
 
         # increase the minibatch counter
         self.minibatch_count += 1
+        self.latency_counter += 1
+
+        if self.latency_counter == 100:
+            duration = time.time() - self.start_time
+            latency = duration / 100
+            self.latency_counter = 0
+            self.start_time = time.time()
+            logger.debug(f'receiving minibatches has latency: {latency}')
 
         if self.pin_memory:
             minibatch = pin_data_memory(minibatch)

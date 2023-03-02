@@ -182,6 +182,7 @@ class DatasetLoader(TaskThread):
         # flags to keep track of shared memory
         # initially false because we need to check response from parent
         self.can_send = False
+        self.total_sent = 0
 
 
     @verbose
@@ -235,6 +236,7 @@ class DatasetLoader(TaskThread):
                             'content': len(minibatch),
                         }
                     )
+                    self.total_sent += 1
 
                     # change the send status
                     async with self.locks.change_send_status:
@@ -264,6 +266,21 @@ class DatasetLoader(TaskThread):
             if self.read_pipe.poll():
                 response = self.read_pipe.recv()
                 if response == 'can_send':
+                    if self.total_sent == 0:
+                        self.start_time = time.time()
+                    if self.total_sent == 100:
+                        duration = time.time() - self.start_time
+                        self.start_time = time.time()
+                        latency = duration / 100
+                        self.total_sent = 0
+                        logger.debug(f'sending 1 minibatch has latency: {latency} seconds')
+                        logger.debug(f'sample_queue size: {self.sample_queue.qsize()}')
+                        if isinstance(self.rotation.queue, list):
+                            logger.debug(f'rotation.queue[0] size: {self.rotation.queue[0].qsize()}')
+                            logger.debug(f'rotation.queue[1] size: {self.rotation.queue[1].qsize()}')
+                        else:
+                            logger.debug(f'rotation.queue size: {self.rotation.queue.qsize()}')
+
                     async with self.locks.change_send_status:
                         self.can_send = True
                 elif response == 'close':
@@ -648,15 +665,10 @@ class DatasetLoader(TaskThread):
 
         try:
             # check if whether the queue is too full
-            if self.rotation.queue_counter > 0:
-                is_full = False
-                self.rotation.queue_counter -= 1
+            if self.rotation.queue.qsize() > self.rotation.queue_max_size:
+                is_full = True
             else:
-                self.rotation.queue_counter = self.rotation.queue_max_size
-                if self.rotation.queue.qsize() > self.rotation.queue_max_size:
-                    is_full = True
-                else:
-                    is_full = False
+                is_full = False
 
             if not is_full:
                 # check whether sample is read from dataset or from cache
@@ -763,19 +775,10 @@ class DatasetLoader(TaskThread):
 
         try:
             # check if whether the queue for writing is too full
-            # here we use queue_counter to avoid checking the size of a queue every time this task is run
-            # we start the queue_counter with the maximum size of the queue,
-            # then decreases every time this task is run
-            # when queue_counter == 0 --> we start the actual checking
-            if self.rotation.queue_counter > 0:
-                is_full = False
-                self.rotation.queue_counter -= 1
+            if self.rotation.queue[self.rotation.write_queue_idx].qsize() > self.rotation.queue_max_size:
+                is_full = True
             else:
-                self.rotation.queue_counter = self.rotation.queue_max_size
-                if self.rotation.queue[self.rotation.write_queue_idx].qsize() > self.rotation.queue_max_size:
-                    is_full = True
-                else:
-                    is_full = False
+                is_full = False
 
             if not is_full and self.rotation.write_allowed:
                 # check whether sample is read from dataset or from cache
@@ -1076,7 +1079,6 @@ class DatasetLoader(TaskThread):
                 self.rotation.queue = [Queue(), Queue()]
                 # this is to keep track of the queue size
                 self.rotation.queue_max_size = max(1, int(0.5 * self.max_queue_size)) * self.batch_size
-                self.rotation.queue_counter = max(1, int(0.5 * self.max_queue_size)) * self.batch_size
                 # this is to keep track of the number of minibatches
                 self.rotation.mb_max_size = self.max_queue_size * self.batch_size
                 self.rotation.mb_counter = self.max_queue_size * self.batch_size
@@ -1120,7 +1122,6 @@ class DatasetLoader(TaskThread):
 
                 # this is to keep track of the queue size
                 self.rotation.queue_max_size = max(1, int(0.5 * self.max_queue_size)) * self.batch_size
-                self.rotation.queue_counter = max(1, int(0.5 * self.max_queue_size)) * self.batch_size
 
                 # this is to keep track of the number of minibatches
                 self.rotation.mb_max_size = max(1, self.max_queue_size) * self.batch_size
