@@ -1,5 +1,5 @@
 from torchvision.datasets import CIFAR10
-from dataset_server import AsyncDataLoader
+from dataset_server import DataLoader
 from tqdm import tqdm
 import numpy as np
 import time
@@ -72,12 +72,11 @@ def test_cache_server():
         'prefix': './data/train_cache',
         'update_frequency': 3,
     }
-    dataloader = AsyncDataLoader(
+    dataloader = DataLoader(
         dataset_class=Dataset,
         dataset_params={'train': True},
         batch_size=64,
-        nb_servers=1,
-        start_port=50000,
+        nb_worker=2,
         max_queue_size=128,
         nearby_shuffle=100,
         cache_setting=cache_setting,

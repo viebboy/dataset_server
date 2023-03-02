@@ -114,7 +114,7 @@ def concatenate_list(inputs, device=None):
     return _concatenate_item(outputs)
 
 
-class Dataloader(TaskThread):
+class DatasetLoader(TaskThread):
     """
     Dataloader class
     """
@@ -145,7 +145,7 @@ class Dataloader(TaskThread):
         self.shuffle = shuffle
         self.nearby_shuffle = nearby_shuffle
 
-        super(Dataloader, self).__init__(parent = None, name=name)
+        super(DatasetLoader, self).__init__(parent = None, name=name)
 
 
     def initVars__(self):

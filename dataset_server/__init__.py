@@ -1,3 +1,3 @@
-from dataset_server.apis import AsyncDataLoader, AsyncDataset
+from dataset_server.apis import DataLoader
 
-__all__ = ['AsyncDataset', 'AsyncDataLoader']
+__all__ = ['DataLoader']

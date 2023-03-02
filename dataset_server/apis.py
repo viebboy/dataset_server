@@ -32,6 +32,7 @@ import threading
 from loguru import logger
 import inspect
 import multiprocessing as MP
+from multiprocessing import shared_memory as SM
 from dataset_server.common import (
     BinaryBlob,
     shuffle_indices,
@@ -92,7 +93,7 @@ class Worker(CTX.Process):
 
         # create random name and shared memory from this name
         kwargs['memory_name'] = get_random_name(32)
-        self.shared_memory = CTX.shared_memory.SharedMemory(
+        self.shared_memory = SM.SharedMemory(
             name=kwargs['memory_name'],
             create=True,
             size=kwargs['max_minibatch_length']
@@ -119,11 +120,11 @@ class Worker(CTX.Process):
             assert key in kwargs
 
     def run(self):
-        from dataset_server.processor import DatasetLoader
+        from dataset_server.worker import DatasetLoader
         import asyncio
 
         # attach to shared memory
-        shared_memory = CTX.shared_memory.SharedMemory(name=self.kwargs['memory_name'])
+        shared_memory = SM.SharedMemory(name=self.kwargs['memory_name'])
 
         loader = DatasetLoader(
             shared_memory=shared_memory,
@@ -132,7 +133,7 @@ class Worker(CTX.Process):
             dataset_module_file=self.kwargs['dataset_module_file'],
             dataset_params_file=self.kwargs['dataset_params_file'],
             nb_loader=self.kwargs['nb_loader'],
-            loader_index=self.kwargs['load_index'],
+            loader_index=self.kwargs['loader_index'],
             batch_size=self.kwargs['batch_size'],
             max_queue_size=self.kwargs['max_queue_size'],
             shuffle=self.kwargs['shuffle'],
@@ -217,7 +218,7 @@ class Worker(CTX.Process):
             return False
 
 
-class MPDataLoader:
+class DataLoader:
     def __init__(
         self,
         dataset_class,
@@ -239,7 +240,12 @@ class MPDataLoader:
         self.workers = []
         self.dataset_params_file = None
 
-        dataset_len = self.check_dataset(dataset_class, dataset_params)
+        dataset_len, max_minibatch_length = self.check_dataset(
+            dataset_class,
+            dataset_params,
+            max_minibatch_length,
+            batch_size,
+        )
 
         if gpu_indices is not None:
             assert len(gpu_indices) == nb_worker
@@ -266,6 +272,7 @@ class MPDataLoader:
             nb_worker=nb_worker,
             worker_len=worker_len,
             max_queue_size=max_queue_size,
+            max_minibatch_length=max_minibatch_length,
             shuffle=shuffle,
             gpu_indices=gpu_indices,
             nearby_shuffle=nearby_shuffle,
@@ -298,16 +305,16 @@ class MPDataLoader:
 
         return worker_len
 
-    def check_dataset(self, dataset_class, dataset_params):
+    def check_dataset(self, dataset_class, dataset_params, max_minibatch_length, batch_size):
         try:
             # try to construct dataset
             dataset_tmp = dataset_class(**dataset_params)
             nb_sample = len(dataset_tmp)
             if max_minibatch_length is None:
-                sample_len = length(dill.dumps(dataset_tmp[0]))
+                sample_len = len(dill.dumps(dataset_tmp[0]))
                 max_minibatch_length = int(sample_len * batch_size * 1.1)
             del dataset_tmp
-            return nb_sample
+            return nb_sample, max_minibatch_length
 
         except Exception as error:
             logger.warning('failed to construct the dataset with the following error')
@@ -374,6 +381,7 @@ class MPDataLoader:
         nb_worker,
         worker_len,
         max_queue_size,
+        max_minibatch_length,
         shuffle,
         gpu_indices,
         nearby_shuffle,
