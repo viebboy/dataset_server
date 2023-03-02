@@ -89,10 +89,11 @@ class Worker(CTX.Process):
         self.cur_minibatch = 0
 
         # create pipe
-        self._read_pipe, self._write_pipe = CTX.Pipe()
+        self._front_read_pipe, self._back_write_pipe = CTX.Pipe()
+        self._back_read_pipe, self._front_write_pipe = CTX.Pipe()
 
         # create random name and shared memory from this name
-        kwargs['memory_name'] = get_random_name(32)
+        kwargs['memory_name'] = get_random_name(16)
         self.shared_memory = SM.SharedMemory(
             name=kwargs['memory_name'],
             create=True,
@@ -119,6 +120,12 @@ class Worker(CTX.Process):
         for key in keys:
             assert key in kwargs
 
+    def read_pipe(self):
+        return self._front_read_pipe
+
+    def write_pipe(self):
+        return self._front_write_pipe
+
     def run(self):
         from dataset_server.worker import DatasetLoader
         import asyncio
@@ -128,8 +135,8 @@ class Worker(CTX.Process):
 
         loader = DatasetLoader(
             shared_memory=shared_memory,
-            read_pipe=self._read_pipe,
-            write_pipe=self._write_pipe,
+            read_pipe=self._back_read_pipe,
+            write_pipe=self._back_write_pipe,
             dataset_module_file=self.kwargs['dataset_module_file'],
             dataset_params_file=self.kwargs['dataset_params_file'],
             nb_loader=self.kwargs['nb_loader'],
@@ -142,12 +149,6 @@ class Worker(CTX.Process):
         )
         loop = asyncio.get_event_loop()
         loop.run_until_complete(loader.run())
-
-    def read_pipe(self):
-        return self._write_pipe
-
-    def write_pipe(self):
-        return self._read_pipe
 
     def process_message(self):
         status = self.read_pipe().recv()
@@ -163,18 +164,18 @@ class Worker(CTX.Process):
             return True
         elif title == 'close_with_error':
             msg = (
-                'the client process ({self.name}) has closed ',
+                'subprocess_error: the client process ({self.name}) has closed ',
                 f'facing the following error: {content}'
             )
             # the subprocess closes by it own
             # we only need to handle from this side
-            self.close()
+            self.close_without_notice()
             raise RuntimeError(''.join(msg))
         else:
             # tell subprocess to close
             self.write_pipe().send('close')
             # then clean up
-            self.close()
+            self.close_with_notice()
             # and raise Exception
             raise RuntimeError(f'unknown message title: {title} from client ({self.name})')
 
@@ -185,7 +186,7 @@ class Worker(CTX.Process):
         return minibatch otherwise
         """
         if not self._is_ready:
-            self.close()
+            self.close_with_notice()
             raise RuntimeError('ChildProcess.get() should be called only when process is ready')
 
         if self.cur_minibatch == self.nb_minibatch:
@@ -200,7 +201,17 @@ class Worker(CTX.Process):
             else:
                 return None
 
-    def close(self):
+    def close_with_notice(self):
+        if not self.is_closed:
+            # perform clean up here
+            self.shared_memory.close()
+            self.shared_memory.unlink()
+            # need to send noti to the subprocess
+            self.write_pipe().send('close')
+            self.write_pipe().close()
+            self.is_closed = True
+
+    def close_without_notice(self):
         if not self.is_closed:
             # perform clean up here
             self.shared_memory.close()
@@ -401,6 +412,7 @@ class DataLoader:
                     'class_name': class_name,
                     'params': dataset_params,
                     'cache_setting': cache_setting,
+                    'rotation_setting': rotation_setting,
                 },
                 fid,
                 recurse=True
@@ -435,21 +447,25 @@ class DataLoader:
                 try:
                     is_ready = self.workers[i].is_ready()
                     if is_ready:
+                        logger.info(f'{self.workers[i].name} is ready')
                         indices.remove(i)
                 except RuntimeError as err:
-                    self.close()
+                    if str(err).startswith('subprocess_error'):
+                        self.close_without_notice()
+                    else:
+                        self.close()
                     raise err
+
             if len(indices) == 0:
                 break
             else:
                 time.sleep(0.1)
 
-
     def close(self):
         # send close signal to the worker
         for worker in self.workers:
             try:
-                worker.close()
+                worker.close_with_notice()
             except Exception as error:
                 logger.warning(f'faced {error} when closing worker {worker.name}')
 
@@ -460,7 +476,24 @@ class DataLoader:
         for worker in self.workers:
             worker.join()
 
-        logger.info('complete cleaning up and closing the MPDataLoader instance')
+        logger.info('complete cleaning up and closing the DataLoader instance')
+
+    def close_without_notice(self):
+        # send close signal to the worker
+        for worker in self.workers:
+            try:
+                worker.close_without_notice()
+            except Exception as error:
+                logger.warning(f'faced {error} when closing worker {worker.name}')
+
+        # cleanup the dataset file and dataset params
+        if self.dataset_params_file is not None and os.path.exists(self.dataset_params_file):
+            os.remove(self.dataset_params_file)
+
+        for worker in self.workers:
+            worker.join()
+
+        logger.info('complete cleaning up and closing the DataLoader instance')
 
 
     def __enter__(self):
@@ -476,6 +509,15 @@ class DataLoader:
         return self
 
     def __next__(self):
+        try:
+            return self.get_minibatch()
+        except StopIteration:
+            raise StopIteration
+        except Exception as error:
+            self.close()
+            raise error
+
+    def get_minibatch(self):
         if self.minibatch_count >= len(self):
             self.minibatch_count = 0
             raise StopIteration
@@ -493,8 +535,17 @@ class DataLoader:
                         minibatch = response
                         break
                 except Exception as error:
-                    self.close()
+                    if str(error).startswith('subprocess_error'):
+                        self.close_without_notice()
+                    else:
+                        self.close()
                     raise error
+
+            if len(self.indices_to_process) == 0:
+                self.indices_to_process = list(range(self.nb_worker))
+                self.minibatch_count = 0
+                if self.shuffle:
+                    random.shuffle(self.indices_to_process)
 
         if len(self.indices_to_process) == 0:
             self.indices_to_process = list(range(self.nb_worker))

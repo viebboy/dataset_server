@@ -250,4 +250,4 @@ class TaskThread(BaseTaskThread):
         logger.info(f'{self.getInfo()} {function_name}: {message}')
 
     def print_warning(self, function_name, message):
-        logger.warning(f'{self.getInfo()} {function_name}: {message}')
+        logger.debug(f'{self.getInfo()} {function_name}: {message}')

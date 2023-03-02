@@ -144,6 +144,9 @@ class DatasetLoader(TaskThread):
         self.max_queue_size = max_queue_size
         self.shuffle = shuffle
         self.nearby_shuffle = nearby_shuffle
+        self.cache = None
+        self.nb_loader = nb_loader
+        self._is_closed = False
 
         super(DatasetLoader, self).__init__(parent = None, name=name)
 
@@ -255,6 +258,8 @@ class DatasetLoader(TaskThread):
         """
         check the message from parent process through pipe
         """
+        if self._is_closed:
+            return
         try:
             if self.read_pipe.poll():
                 response = self.read_pipe.recv()
@@ -265,6 +270,7 @@ class DatasetLoader(TaskThread):
                     # receive close signal
                     logger.info(f'receive close signal from parent process; closing now...')
                     await self.clean_and_exit()
+                    return
             else:
                 await asyncio.sleep(0.001)
 
@@ -306,6 +312,8 @@ class DatasetLoader(TaskThread):
         """
         this task is used to write rotation data to disk
         """
+        if self._is_closed:
+            return
         try:
             async with self.locks.check_record:
                 if self.rotation.records[1].mode() == 'write':
@@ -382,6 +390,8 @@ class DatasetLoader(TaskThread):
 
     @verbose
     async def finalize_rotation_file_writing(self):
+        if self._is_closed:
+            return
         try:
             # check if we need to flush indices to ignore
             if len(self.rotation.disk.indices_to_ignore_list[0]) > 0:
@@ -438,6 +448,9 @@ class DatasetLoader(TaskThread):
         self.rotation.disk.indices_to_ignore = Queue
 
         """
+        if self._is_closed:
+            return
+
         try:
             async with self.locks.check_record:
                 if self.rotation.records[0].mode() == 'read':
@@ -547,6 +560,9 @@ class DatasetLoader(TaskThread):
         basically this task will read samples from a read queue in self.rotation.queue
         if a sample has been not been rotated enough, it will be put back to self.rotation.queue
         """
+        if self._is_closed:
+            return
+
         try:
             # reset counter if needed
             # read_sample_idx is a counter to keep track of how many samples
@@ -626,6 +642,10 @@ class DatasetLoader(TaskThread):
         """
         this function is used when rotation on disk is specified
         """
+
+        if self._is_closed:
+            return
+
         try:
             # check if whether the queue is too full
             if self.rotation.queue_counter > 0:
@@ -738,6 +758,8 @@ class DatasetLoader(TaskThread):
         this task is scheduled to repeat indefinitely until canceled
         this task is used when there is no rotation (max_rotation=1) or rotation is done on memory
         """
+        if self._is_closed:
+            return
 
         try:
             # check if whether the queue for writing is too full
@@ -853,6 +875,8 @@ class DatasetLoader(TaskThread):
 
     @verbose
     async def change_write_queue_index(self):
+        if self._is_closed:
+            return
         try:
             # reset the counter
             self.rotation.write_sample_idx = 0
@@ -881,6 +905,7 @@ class DatasetLoader(TaskThread):
 
     @verbose
     async def warn_and_exit(self, function_name, warning):
+        self._is_closed = True
         # clean up cacche
         if self.cache is not None:
             self.cache.record.close()
@@ -900,7 +925,26 @@ class DatasetLoader(TaskThread):
         await super().warn_and_exit(function_name, warning)
 
     @verbose
-    async def clean_and_exit(self, function_name, warning):
+    async def stop_record_related_tasks(self):
+        self.tasks.generate_sample_with_rotation = await delete(
+            self.tasks.generate_sample_with_rotation
+        )
+        self.tasks.generate_sample_without_rotation = await delete(
+            self.tasks.generate_sample_without_rotation
+        )
+        self.tasks.rotate_data_on_disk = await delete(
+            self.tasks.rotate_data_on_disk
+        )
+        self.tasks.rotate_data_on_memory = await delete(
+            self.tasks.rotate_data_on_memory
+        )
+        self.tasks.cache_rotation = await delete(
+            self.tasks.cache_rotation
+        )
+
+    @verbose
+    async def clean_and_exit(self):
+        self._is_closed = True
         # clean up cacche
         if self.cache is not None:
             self.cache.record.close()
@@ -916,9 +960,8 @@ class DatasetLoader(TaskThread):
         # close the write pipe
         self.write_pipe.close()
 
-        # then stop everything
+        # stop everything
         await self.stop()
-
 
     @verbose
     async def load_dataset__(self):
@@ -982,7 +1025,7 @@ class DatasetLoader(TaskThread):
             self.rotation.medium = rotation_setting['medium']
             self.rotation.max_rotation = rotation_setting['rotation']
             self.rotation.min_size = self.batch_size + 1
-            if self.rotation_medium == 'memory':
+            if self.rotation.medium == 'memory':
                 self.rotation.max_size = self.batch_size * self.max_queue_size
             else:
                 self.rotation.max_size = rotation_setting['size']
