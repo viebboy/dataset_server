@@ -17,26 +17,6 @@ class Dataset(CIFAR10):
         x = np.asarray(x)
         return x, y
 
-def test_default(qt_threading):
-    logger.info(f'test default setting with qt_threading={qt_threading}')
-    dataloader = AsyncDataLoader(
-        dataset_class=Dataset,
-        dataset_params={'train': True},
-        batch_size=64,
-        nb_servers=1,
-        start_port=50000,
-        max_queue_size=128,
-        qt_threading=qt_threading,
-    )
-    print(f'data loader length: {len(dataloader)}')
-
-    start = time.time()
-    for samples in tqdm(dataloader):
-        pass
-    stop = time.time()
-    dataloader.close()
-    logger.info('complete testing the default config')
-
 def test_cache_client():
     logger.info(f'test caching setting in client side with')
     cache_setting = {

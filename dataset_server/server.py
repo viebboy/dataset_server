@@ -318,7 +318,6 @@ class ServerConnectionHandler(TaskThread):
             else:
                 if len(packet) > 0:
                     # all good!  keep on reading = reschedule this
-                    logger.debug(f"read_socket__: got packet with size {len(packet)}")
                     # send the payload to parent:
                     await self.handle_read_packet__(packet)
                     """you can re-schedule with a moderate frequency, say, 100 times per second,
@@ -682,17 +681,10 @@ class DataloaderServer(TaskThread):
 
     def is_minibatch_queue_full(self):
         # check if whether the numbef of minibatches to be sent is too much
-        if self.rotation.mb_counter > 0:
-            is_full = False
-            self.rotation.mb_counter -= 1
+        if self.minibatch_queue.qsize() > self.max_queue_size:
+            return True
         else:
-            self.rotation.mb_counter = self.rotation.mb_max_size
-            if self.minibatch_queue.qsize() > self.max_queue_size:
-                is_full = True
-            else:
-                is_full = False
-
-        return is_full
+            return False
 
     @verbose
     async def rotate_data_on_disk__(self):
@@ -700,14 +692,6 @@ class DataloaderServer(TaskThread):
         this function reads data from self.rotation.records
         and start batching
         and keep track of how many times a sample has been rotated
-
-        self.locks.check_record
-
-        self.rotation.disk.sample_counter = 0
-        self.rotation.disk.current_round = 0
-        self.rotation.disk.indices_to_read = []
-        self.rotation.disk.indices_to_ignore = Queue
-
         """
         try:
             async with self.locks.check_record:
@@ -837,18 +821,7 @@ class DataloaderServer(TaskThread):
                         # batch these leftover samples
                         await self.start_batching()
 
-            # check if whether the numbef of minibatches to be sent is too much
-            # mn_counter is a proxy counter to reduce the time we check
-            # minibatch_queue
-            if self.rotation.mb_counter > 0:
-                is_full = False
-                self.rotation.mb_counter -= 1
-            else:
-                self.rotation.mb_counter = self.rotation.mb_max_size
-                if self.minibatch_queue.qsize() > self.max_queue_size:
-                    is_full = True
-                else:
-                    is_full = False
+            is_full = self.is_minibatch_queue_full()
 
             # check if the read_queue has minimum size to start reading
             # this is because when we read a sample, we will put it back to the
@@ -1297,8 +1270,6 @@ class DataloaderServer(TaskThread):
                 self.rotation.queue_max_size = self.rotation.max_size
                 self.rotation.queue_counter = self.rotation.max_size
                 # this is to keep track of the number of minibatches
-                self.rotation.mb_max_size = max(1, self.max_queue_size) * self.batch_size
-                self.rotation.mb_counter = max(1, self.max_queue_size) * self.batch_size
                 # there are 2 queues, read and write queue
                 # these are counters for read queue
                 self.rotation.read_queue_idx = 0
@@ -1331,19 +1302,10 @@ class DataloaderServer(TaskThread):
                 # for rotation on disk, we dont need to take care of rotation
                 # when generating sample
                 self.rotation.queue = Queue()
-                # when rotation on disk, the queue max size is equal to the
-                # number of samples at max_queue_size (that is, multiplied by
-                # batch size because max_queue_size has a unit of minibatch
-                # rotation.max_size is the total number of samples that are
-                # written to a binary blob
-
                 # this is to keep track of the queue size
                 self.rotation.queue_max_size = max(1, self.max_queue_size) * self.batch_size
                 self.rotation.queue_counter = max(1, self.max_queue_size) * self.batch_size
 
-                # this is to keep track of the number of minibatches
-                self.rotation.mb_max_size = max(1, self.max_queue_size) * self.batch_size
-                self.rotation.mb_counter = max(1, self.max_queue_size) * self.batch_size
 
                 self.rotation.sample_idx = 0
                 self.rotation.epoch_idx = 0

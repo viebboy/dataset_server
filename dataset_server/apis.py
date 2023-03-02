@@ -513,7 +513,6 @@ class AsyncDataLoader:
         self.rotation = self.check_rotation_setting(client_rotation_setting, 'client', max_queue_size)
         self.check_rotation_setting(server_rotation_setting, 'server', max_queue_size)
 
-
         # start the servers
         logger.info('starting services, this will take a while')
         self.status_files = self.start_servers(
@@ -906,21 +905,22 @@ class AsyncDataset(AsyncDataLoader):
         self,
         dataset_class,
         dataset_params: dict,
+        batch_size: int,
         nb_servers: int,
         start_port: int=11111,
         max_queue_size: int=20,
         shuffle: bool=False,
         device=None,
         pin_memory=False,
-        packet_size=125000,
+        packet_size=125_000,
         wait_time=10,
         client_wait_time=10,
         nb_retry=10,
         gpu_indices=None,
-        qt_threading=False,
         nearby_shuffle: int=0,
         cache_setting=None,
-        rotation_setting=None,
+        client_rotation_setting=None,
+        server_rotation_setting=None,
     ):
         super().__init__(
             dataset_class=dataset_class,
@@ -940,5 +940,6 @@ class AsyncDataset(AsyncDataLoader):
             qt_threading=qt_threading,
             nearby_shuffle=nearby_shuffle,
             cache_setting=cache_setting,
-            rotation_setting=rotation_setting,
+            client_rotation_setting=client_rotation_setting,
+            server_rotation_setting=server_rotation_setting,
         )
