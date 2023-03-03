@@ -10,6 +10,10 @@ When caching is not an option because saving the entire dataset requires too muc
 
 Rotation can be done either on memory or on disk space. 
 
+Before moving on to the usage of `dataset_server`, you should ask yourself whether your data is organized efficiently for reading?!. 
+For example, a large image dataset can be organized in large binary files (instead of individual image files) to avoid too much IO operations. 
+Take a look at my other library [mlproject](https://github.com/viebboy/mlproject) that contains many efficient abstraction for data used in ML.
+
 
 ## Installation
 
@@ -58,7 +62,7 @@ for samples in async_dataloader:
     # perform processing here with the samples
 ```
 
-## dataset_server.DataLoader in-depth 
+## `dataset_server.DataLoader` in-depth 
 
 The signature of `dataset_server.DataLoader` looks like this:
 
@@ -112,3 +116,42 @@ with:
 - `collate_fn`: (callable, default to None): if specified, this function should takes a list of samples and perform sample collation. 
   The default collation is simply tensor (support numpy and torch) concatenation. 
 
+
+## Caching
+
+Caching can be done by specifying a dictionary. This dictionary should contain 2 keys: `prefix` and `update_frequency`. 
+
+`prefix` specifies the filename prefix of binary files that will contain the cached samples.
+
+`update_frequency` specifies the frequency at which the cache will be rewritten. This value should be at least 2.
+
+For example, if `update_frequency=5`, cache files will be rewritten every 5 epochs.
+
+If your dataset performs some kind of data augmentation, that is the samples generated from the dataset are different at different epochs, we don't the update frequency to be too high because this defeats the purpose of random augmentation.
+
+If your dataset doesn't perform any data augmentation, you can set `update_frequency` to inf so that cached files are never updated, which achieves the best performance in terms of data loading.
+
+When caching is used, there should be enough additional disk space to hold your dataset. If disk space is a problem (like limiting disk space in a node in a compute instance), you should use rotation.
+
+
+## Rotation
+
+Rotation means a sample is reused X times. Users can specify whether rotated samples are retained on memory (if you have big RAM) or on disk. 
+
+When using rotation on disk, we could specify the amount of samples that are being rotated at the same time (basically the higher this number is, the more disk space we need).
+
+To specify rotation, users should pass a dictionary that contains at least 2 keys: `medium` and `rotation`. 
+
+The value of `medium` could be either "memory" or "disk".
+
+The value of `rotation` (a number, should be at least 2) indicates how many times a sample is reused. This effectively increases the size of an epoch. 
+If `rotation=3`, each sample is duplicated 3 times and the size of the dataset is increased by 3 times. 
+
+If rotation medium is "disk", users need to also specify `prefix` and `size`.
+`prefix` specifies the filename prefix of the binary files used to hold the rotated samples.
+`size` specifies the number of samples that are rotated at the same time. This value also dictates the size of the binary files.
+
+Obviously, rotation is ONLY useful for training set. Instead of training for 100 epochs, you could set the code to train for 10 epochs and put `rotation` to 10. 
+
+## Authors
+Dat Tran (viebboy@gmail.com)
