@@ -282,7 +282,6 @@ class DatasetLoader(TaskThread):
                 response = self.read_pipe.recv()
                 if response == 'can_send':
 
-                    logger.debug(f'total_sent: {self.total_sent}')
                     if self.total_sent == 0:
                         self.start_time = time.time()
                     else:
@@ -300,7 +299,6 @@ class DatasetLoader(TaskThread):
                             logger.debug(f'rotation.queue[1] size: {self.rotation.queue[1].qsize()}')
                         else:
                             logger.debug(f'rotation.queue size: {self.rotation.queue.qsize()}')
-
 
                     async with self.locks.change_send_status:
                         self.can_send = True
