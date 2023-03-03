@@ -170,6 +170,7 @@ class DatasetLoader(TaskThread):
 
         # this holds lists of samples to be concatenated
         self.sample_queue = Queue()
+        self.sample_queue_buffer = []
 
         # this holds ready minibatches to be sent
         # this queue is shared by both the telcom thread and the main thread
@@ -215,33 +216,48 @@ class DatasetLoader(TaskThread):
 
     @verbose
     async def generate_minibatch__(self):
-        # batching the samples and send to children
         try:
-            if not self.sample_queue.empty() and self.can_send:
-                samples = self.sample_queue.get()
-                minibatch = concatenate_list(samples)
-                minibatch = dill.dumps(minibatch)
-                if len(minibatch) > self.max_shared_mem_size:
-                    await self.warn_and_exit(
-                        'generate_minibatch__',
-                        'got a minibatch that is bigger than shared memory space'
-                    )
+            if self.can_send:
+                # if buffer has minibatches, use them
+                if len(self.sample_queue_buffer) > 0:
+                    minibatch = self.sample_queue_buffer.pop(0)
                 else:
-                    # put bytes into shared_memory
-                    self.shared_memory.buf[:len(minibatch)] = minibatch
-                    # then send the number of bytes to read
-                    self.write_pipe.send(
-                        {
-                            'title': 'minibatch_length',
-                            'content': len(minibatch),
-                        }
-                    )
+                    # otherwise pop out from sample_queue
+                    if not self.sample_queue.empty():
+                        samples = self.sample_queue.get()
+                        minibatch = concatenate_list(samples)
+                    else:
+                        minibatch = None
 
-                    # change the send status
-                    async with self.locks.change_send_status:
-                        self.can_send = False
+                if minibatch is not None:
+                    minibatch = dill.dumps(minibatch)
+                    if len(minibatch) > self.max_shared_mem_size:
+                        await self.warn_and_exit(
+                            'generate_minibatch__',
+                            'got a minibatch that is bigger than shared memory space'
+                        )
+                    else:
+                        # put bytes into shared_memory
+                        self.shared_memory.buf[:len(minibatch)] = minibatch
+                        # then send the number of bytes to read
+                        self.write_pipe.send(
+                            {
+                                'title': 'minibatch_length',
+                                'content': len(minibatch),
+                            }
+                        )
+
+                        # change the send status
+                        async with self.locks.change_send_status:
+                            self.can_send = False
             else:
-                await asyncio.sleep(0.001)
+                # if cannot send, we can perform batching
+                if not self.sample_queue.empty() and len(self.sample_queue_buffer) <= self.max_queue_size:
+                    samples = self.sample_queue.get()
+                    minibatch = concatenate_list(samples)
+                    self.sample_queue_buffer.append(minibatch)
+                else:
+                    await asyncio.sleep(0.001)
 
             self.tasks.generate_minibatch = await reSchedule(self.generate_minibatch__)
 
@@ -266,6 +282,7 @@ class DatasetLoader(TaskThread):
                 response = self.read_pipe.recv()
                 if response == 'can_send':
 
+                    logger.debug(f'total_sent: {self.total_sent}')
                     if self.total_sent == 0:
                         self.start_time = time.time()
                     else:
@@ -480,7 +497,14 @@ class DatasetLoader(TaskThread):
                 if self.rotation.records[0].mode() == 'read':
                     can_read = True
                 else:
-                    can_read = False
+                    # rotation.records[0] is not in read mode, check if
+                    # records[1] is in read mode to swap
+                    if self.rotation.records[1].mode() == 'read':
+                        self.rotation.records = self.rotation.records[::-1]
+                        can_read = True
+                    else:
+                        can_read = False
+
                 is_full = self.is_sample_queue_full()
 
             if not can_read:
