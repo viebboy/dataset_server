@@ -73,6 +73,41 @@ def pin_data_memory(x):
         return x.pin_memory()
 
 
+def extract_data_from_workers(workers, data_queue, max_queue_size, shuffle, close_event):
+    indices = list(range(len(workers)))
+    if shuffle:
+        random.shuffle(indices)
+
+    while True:
+        if close_event.is_set():
+            logger.info(f'receive signal to close the thread that pulls data from workers')
+            return
+
+        if data_queue.qsize() >= max_queue_size:
+            time.sleep(0.001)
+        else:
+            minibatch = None
+            while not close_event.is_set():
+                for i in indices:
+                    # if shuffle, then we get without waiting
+                    response = workers[i].get(wait = not shuffle)
+                    if response == 'epoch_end':
+                        # this is the end of epoch, remove i from indices
+                        indices.remove(i)
+                    elif response is not None:
+                        minibatch = response
+                        break
+
+                if len(indices) == 0:
+                    indices = list(range(len(workers)))
+                    if shuffle:
+                        random.shuffle(indices)
+
+                if minibatch is not None:
+                    break
+            data_queue.put(minibatch)
+
+
 class Worker(CTX.Process):
     """
     Worker process that handles small part of the dataset loading
@@ -169,7 +204,7 @@ class Worker(CTX.Process):
             return True
         elif title == 'close_with_error':
             msg = (
-                'subprocess_error: the client process ({self.name}) has closed ',
+                f'subprocess_error: the client process ({self.name}) has closed ',
                 f'facing the following error: {content}'
             )
             # the subprocess closes by it own
@@ -251,6 +286,8 @@ class DataLoader:
         nearby_shuffle: int=0,
         cache_setting=None,
         rotation_setting=None,
+        use_threading=False,
+        collate_fn=None,
     ):
 
         self.workers = []
@@ -294,6 +331,7 @@ class DataLoader:
             nearby_shuffle=nearby_shuffle,
             cache_setting=cache_setting,
             rotation_setting=rotation_setting,
+            collate_fn=collate_fn,
         )
 
         self.batch_size = batch_size
@@ -306,6 +344,23 @@ class DataLoader:
         self.minibatch_count = 0
         self.latency_counter = None
         self.indices_to_process = list(range(nb_worker))
+        self.use_threading = use_threading
+
+        if use_threading:
+            # now start a thread to pull from workers
+            self.close_event = threading.Event()
+            self.data_queue = Queue()
+            self.pull_data_thread = threading.Thread(
+                target=extract_data_from_workers,
+                args=(
+                    self.workers,
+                    self.data_queue,
+                    max_queue_size,
+                    shuffle,
+                    self.close_event
+                )
+            )
+            self.pull_data_thread.start()
 
         if prefetch_time is not None and prefetch_time > 0:
             logger.info(f'waiting {prefetch_time} seconds to prefetch data')
@@ -404,6 +459,7 @@ class DataLoader:
         nearby_shuffle,
         cache_setting,
         rotation_setting,
+        collate_fn,
     ):
         class_name = dataset_class.__name__
         dataset_module_file = inspect.getfile(dataset_class)
@@ -419,6 +475,7 @@ class DataLoader:
                     'params': dataset_params,
                     'cache_setting': cache_setting,
                     'rotation_setting': rotation_setting,
+                    'collate_fn': collate_fn,
                 },
                 fid,
                 recurse=True
@@ -469,6 +526,9 @@ class DataLoader:
                 time.sleep(0.1)
 
     def close(self):
+        if self.use_threading:
+            self.close_event.set()
+
         # send close signal to the worker
         for worker in self.workers:
             try:
@@ -483,9 +543,15 @@ class DataLoader:
         for worker in self.workers:
             worker.join()
 
+        if self.use_threading:
+            self.pull_data_thread.join()
+
         logger.info('complete cleaning up and closing the DataLoader instance')
 
     def close_without_notice(self):
+        if self.use_threading:
+            self.close_event.set()
+
         # send close signal to the worker
         for worker in self.workers:
             try:
@@ -499,6 +565,9 @@ class DataLoader:
 
         for worker in self.workers:
             worker.join()
+
+        if self.use_threading:
+            self.pull_data_thread.join()
 
         logger.info('complete cleaning up and closing the DataLoader instance')
 
@@ -517,14 +586,17 @@ class DataLoader:
 
     def __next__(self):
         try:
-            return self.get_minibatch()
+            if self.use_threading:
+                return self.get_minibatch_with_threading()
+            else:
+                return self.get_minibatch_without_threading()
         except StopIteration:
             raise StopIteration
         except Exception as error:
             self.close()
             raise error
 
-    def get_minibatch(self):
+    def get_minibatch_without_threading(self):
         if self.minibatch_count >= len(self):
             self.minibatch_count = 0
             raise StopIteration
@@ -536,9 +608,7 @@ class DataLoader:
                     response = self.workers[i].get(wait = not self.shuffle)
                     if response == 'epoch_end':
                         self.indices_to_process.remove(i)
-                    elif response is None:
-                        pass
-                    else:
+                    elif response is not None:
                         minibatch = response
                         break
                 except Exception as error:
@@ -558,6 +628,30 @@ class DataLoader:
             self.indices_to_process = list(range(self.nb_worker))
             if self.shuffle:
                 random.shuffle(self.indices_to_process)
+
+        # increase the minibatch counter
+        self.minibatch_count += 1
+
+        if self.pin_memory:
+            minibatch = pin_data_memory(minibatch)
+
+        if self.device is not None:
+            minibatch = move_data_to_device(minibatch, device)
+
+        return minibatch
+
+    def get_minibatch_with_threading(self):
+        if self.minibatch_count >= len(self):
+            self.minibatch_count = 0
+            raise StopIteration
+
+        while True:
+            try:
+                minibatch = self.data_queue.get(block=False)
+                break
+            except queue.Empty:
+                time.sleep(0.0001)
+                pass
 
         # increase the minibatch counter
         self.minibatch_count += 1

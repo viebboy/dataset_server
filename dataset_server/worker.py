@@ -16,7 +16,6 @@ Apache License 2.0
 
 """
 
-import torch
 import asyncio, logging, json, socket, dill, random
 import traceback
 import time
@@ -47,71 +46,75 @@ from dataset_server.common import (
 )
 
 
-def concatenate_list(inputs, device=None):
-    """
-    This function is used to concatenate
-    a list of nested lists of numpy array (or torch) to a nested list of numpy arrays or torch
+def get_default_collate_fn():
+    import torch
+    def concatenate_list(inputs, device=None):
+        """
+        This function is used to concatenate
+        a list of nested lists of numpy array (or torch) to a nested list of numpy arrays or torch
 
-    For example,
-    inputs = [x_1, x_2, ..., x_N]
-    each x_i is a nested list of numpy arrays
-    for example,
-    x_i = [np.ndarray, [np.ndarray, np.ndarray]]
+        For example,
+        inputs = [x_1, x_2, ..., x_N]
+        each x_i is a nested list of numpy arrays
+        for example,
+        x_i = [np.ndarray, [np.ndarray, np.ndarray]]
 
-    the outputs should be
-    outputs = [np.ndarray, [np.ndarray, np.ndarray]]
-    in which each np.ndarray is a concatenation of the corresponding element
-    from the same position
-    """
+        the outputs should be
+        outputs = [np.ndarray, [np.ndarray, np.ndarray]]
+        in which each np.ndarray is a concatenation of the corresponding element
+        from the same position
+        """
 
-    def _create_nested_list(x, data):
-        if isinstance(x, (list, tuple)):
-            # there is a nested structure
-            # create sub list for each item
-            for _ in range(len(x)):
-                data.append([])
-            for idx, item in enumerate(x):
-                _create_nested_list(item, data[idx])
-        else:
-            # do nothing to the input list
-            next
-
-    def _process_sample(x, data):
-        if isinstance(x, (list, tuple)):
-            for idx, item in enumerate(x):
-                _process_sample(item, data[idx])
-        else:
-            data.append(x)
-
-    # create an empty nested list based on the structure of the 1st sample
-    outputs = []
-    _create_nested_list(inputs[0], outputs)
-
-    # then process each sample
-    for sample in inputs:
-        _process_sample(sample, outputs)
-
-    def _concatenate_item(x):
-        if isinstance(x, list) and isinstance(x[0], torch.Tensor):
-            if torch.numel(x[0]) == 1:
-                result = torch.cat(x)
+        def _create_nested_list(x, data):
+            if isinstance(x, (list, tuple)):
+                # there is a nested structure
+                # create sub list for each item
+                for _ in range(len(x)):
+                    data.append([])
+                for idx, item in enumerate(x):
+                    _create_nested_list(item, data[idx])
             else:
-                result = torch.cat([item.unsqueeze(0) for item in x], dim=0)
+                # do nothing to the input list
+                next
 
-            if device is not None:
-                return result.to(device)
+        def _process_sample(x, data):
+            if isinstance(x, (list, tuple)):
+                for idx, item in enumerate(x):
+                    _process_sample(item, data[idx])
             else:
-                return result
-        elif isinstance(x, list) and isinstance(x[0], np.ndarray):
-            return np.concatenate([np.expand_dims(item, 0) for item in x], axis=0)
-        elif isinstance(x, list) and isinstance(x[0], (float, int)):
-            return np.asarray(x).flatten()
-        elif isinstance(x, list) and isinstance(x[0], list):
-            return [_concatenate_item(item) for item in x]
-        else:
-            raise RuntimeError('Failed to concatenate a list of samples generated from dataset')
+                data.append(x)
 
-    return _concatenate_item(outputs)
+        # create an empty nested list based on the structure of the 1st sample
+        outputs = []
+        _create_nested_list(inputs[0], outputs)
+
+        # then process each sample
+        for sample in inputs:
+            _process_sample(sample, outputs)
+
+        def _concatenate_item(x):
+            if isinstance(x, list) and isinstance(x[0], torch.Tensor):
+                if torch.numel(x[0]) == 1:
+                    result = torch.cat(x)
+                else:
+                    result = torch.cat([item.unsqueeze(0) for item in x], dim=0)
+
+                if device is not None:
+                    return result.to(device)
+                else:
+                    return result
+            elif isinstance(x, list) and isinstance(x[0], np.ndarray):
+                return np.concatenate([np.expand_dims(item, 0) for item in x], axis=0)
+            elif isinstance(x, list) and isinstance(x[0], (float, int)):
+                return np.asarray(x).flatten()
+            elif isinstance(x, list) and isinstance(x[0], list):
+                return [_concatenate_item(item) for item in x]
+            else:
+                raise RuntimeError('Failed to concatenate a list of samples generated from dataset')
+
+        return _concatenate_item(outputs)
+
+    return concatenate_list
 
 
 class DatasetLoader(TaskThread):
@@ -197,6 +200,9 @@ class DatasetLoader(TaskThread):
         and put them in self.sample_queue, which is monitored by another repetitive task
         called generate_minibatch__
         """
+        if self._is_closed:
+            return
+
         try:
             # move the current minibatch into sample_queue for batching
             # reset the current minibatch
@@ -216,6 +222,9 @@ class DatasetLoader(TaskThread):
 
     @verbose
     async def generate_minibatch__(self):
+        if self._is_closed:
+            return
+
         try:
             if self.can_send:
                 # if buffer has minibatches, use them
@@ -225,7 +234,7 @@ class DatasetLoader(TaskThread):
                     # otherwise pop out from sample_queue
                     if not self.sample_queue.empty():
                         samples = self.sample_queue.get()
-                        minibatch = concatenate_list(samples)
+                        minibatch = self.collate_fn(samples)
                     else:
                         minibatch = None
 
@@ -254,7 +263,7 @@ class DatasetLoader(TaskThread):
                 # if cannot send, we can perform batching
                 if not self.sample_queue.empty() and len(self.sample_queue_buffer) <= self.max_queue_size:
                     samples = self.sample_queue.get()
-                    minibatch = concatenate_list(samples)
+                    minibatch = self.collate_fn(samples)
                     self.sample_queue_buffer.append(minibatch)
                 else:
                     await asyncio.sleep(0.001)
@@ -347,6 +356,8 @@ class DatasetLoader(TaskThread):
     async def cache_rotation__(self):
         """
         this task is used to write rotation data to disk
+        it reads data from self.rotation.queue and write data to disk
+        it can also start batching if rotate_data_on_disk__ is not activated
         """
         if self._is_closed:
             return
@@ -375,7 +386,7 @@ class DatasetLoader(TaskThread):
                         minibatch = self.rotation.queue.get(block=False)
                         if minibatch is None:
                             # finalize the writing stage
-                            await self.finalize_rotation_file_writing()
+                            await self.finalize_rotation_file_writing(self.rotation.disk.sample_write_idx)
 
                             # in addition, batching if needed
                             if need_batching and len(self.current_minibatch[0]) > 0:
@@ -407,7 +418,7 @@ class DatasetLoader(TaskThread):
                             # check if reaching the maximum size of a record
                             if self.rotation.disk.sample_write_idx == self.rotation.max_size:
                                 # finalize the writing stage
-                                await self.finalize_rotation_file_writing()
+                                await self.finalize_rotation_file_writing(self.rotation.disk.sample_write_idx)
 
                     except queue.Empty():
                         # empty read
@@ -428,8 +439,10 @@ class DatasetLoader(TaskThread):
             )
 
     @verbose
-    async def finalize_rotation_file_writing(self):
+    async def finalize_rotation_file_writing(self, idx):
         if self._is_closed:
+            return
+        if idx == 0:
             return
         try:
             # check if we need to flush indices to ignore
@@ -475,17 +488,8 @@ class DatasetLoader(TaskThread):
     @verbose
     async def rotate_data_on_disk__(self):
         """
-        this function reads data from self.rotation.records
-        and start batching
-        and keep track of how many times a sample has been rotated
-
-        self.locks.check_record
-
-        self.rotation.disk.sample_counter = 0
-        self.rotation.disk.current_round = 0
-        self.rotation.disk.indices_to_read = []
-        self.rotation.disk.indices_to_ignore = Queue
-
+        this function reads data from self.rotation.records,
+        start batching and keep track of how many times a sample has been rotated
         """
         if self._is_closed:
             return
@@ -525,6 +529,9 @@ class DatasetLoader(TaskThread):
                         try:
                             indices_to_ignore = self.rotation.disk.indices_to_ignore.get(block=False)
                             indices = [i for i in indices if i not in indices_to_ignore]
+                            # increase the counter because we dont need to read
+                            # those indices
+                            self.rotation.disk.sample_counter += len(indices_to_ignore)
                         except queue.Empty:
                             pass
                     self.rotation.disk.indices_to_read = indices
@@ -957,23 +964,6 @@ class DatasetLoader(TaskThread):
 
         await super().warn_and_exit(function_name, warning)
 
-    @verbose
-    async def stop_record_related_tasks(self):
-        self.tasks.generate_sample_with_rotation = await delete(
-            self.tasks.generate_sample_with_rotation
-        )
-        self.tasks.generate_sample_without_rotation = await delete(
-            self.tasks.generate_sample_without_rotation
-        )
-        self.tasks.rotate_data_on_disk = await delete(
-            self.tasks.rotate_data_on_disk
-        )
-        self.tasks.rotate_data_on_memory = await delete(
-            self.tasks.rotate_data_on_memory
-        )
-        self.tasks.cache_rotation = await delete(
-            self.tasks.cache_rotation
-        )
 
     @verbose
     async def clean_and_exit(self):
@@ -1031,6 +1021,10 @@ class DatasetLoader(TaskThread):
                 params = settings['params']
                 cache_setting = settings['cache_setting']
                 rotation_setting = settings['rotation_setting']
+                if settings['collate_fn'] is not None:
+                    self.collate_fn = settings['collate_fn']
+                else:
+                    self.collate_fn = get_default_collate_fn()
 
             logger.debug(f'complete loading parameters for dataset')
 
