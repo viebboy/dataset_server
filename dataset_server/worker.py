@@ -9,6 +9,8 @@ worker.py: data processing implementation using async
 * Date: 2022-07-29
 * Version: 0.0.1
 
+This is part of the dataset_server project
+
 License
 -------
 Apache License 2.0
@@ -16,8 +18,8 @@ Apache License 2.0
 
 """
 
-import asyncio, logging, json, socket, dill, random
-import traceback
+import asyncio
+import dill
 import time
 import sys
 import queue
@@ -25,6 +27,7 @@ from queue import Queue
 import math
 import numpy as np
 import os
+import random
 from task_thread import (
     reCreate,
     reSchedule,
@@ -234,7 +237,10 @@ class DatasetLoader(TaskThread):
                     # otherwise pop out from sample_queue
                     if not self.sample_queue.empty():
                         samples = self.sample_queue.get()
-                        minibatch = self.collate_fn(samples)
+                        if len(samples) > 1:
+                            minibatch = self.collate_fn(samples)
+                        else:
+                            minibatch = samples[0]
                     else:
                         minibatch = None
 
@@ -263,7 +269,10 @@ class DatasetLoader(TaskThread):
                 # if cannot send, we can perform batching
                 if not self.sample_queue.empty() and len(self.sample_queue_buffer) <= self.max_queue_size:
                     samples = self.sample_queue.get()
-                    minibatch = self.collate_fn(samples)
+                    if len(samples) > 1:
+                        minibatch = self.collate_fn(samples)
+                    else:
+                        minibatch = samples[0]
                     self.sample_queue_buffer.append(minibatch)
                 else:
                     await asyncio.sleep(0.001)

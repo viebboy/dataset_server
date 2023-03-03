@@ -9,6 +9,8 @@ apis.py: interfaces for dataset server
 * Date: 2022-06-14
 * Version: 0.0.1
 
+This is part of the dataset_server project
+
 License
 -------
 Apache License 2.0
@@ -16,11 +18,9 @@ Apache License 2.0
 
 """
 
-import subprocess
 import dill
 import tempfile
 import time
-import socket
 import sys
 import string
 import random

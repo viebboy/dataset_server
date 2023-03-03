@@ -44,9 +44,33 @@ def test_default(use_threading):
     dataloader.close()
     logger.info('complete testing default setting')
 
+def test_as_dataset(use_threading):
+    logger.info(f'test running as dataset, aka batch_size=1')
+    batch_size = 1
+    dataloader = DataLoader(
+        dataset_class=Dataset,
+        dataset_params={'train': True},
+        batch_size=batch_size,
+        nb_worker=1,
+        max_queue_size=128,
+        nearby_shuffle=100,
+        shuffle=False,
+        use_threading=use_threading,
+    )
+    print(f'data loader length: {len(dataloader)}')
+
+    for _ in range(1):
+        for idx, samples in tqdm(enumerate(dataloader)):
+            time.sleep(0.01)
+
+    dataloader.close()
+    logger.info('complete testing running as a dataset')
+
+
+
 
 def test_cache(use_threading):
-    logger.info(f'test caching setting in server side')
+    logger.info(f'test caching')
     cache_setting = {
         'prefix': './data/train_cache',
         'update_frequency': 3,
@@ -126,20 +150,14 @@ def test_rotation_on_disk(use_threading):
 
     stop = time.time()
     dataloader.close()
-    logger.info('complete testing rotation on client on disk')
-
+    logger.info('complete testing rotation on disk')
 
 
 if __name__ == '__main__':
     #---------------------------------------
-    #test_cache_server()
-    #test_cache_client()
-    #test_rotation_on_memory()
-    #test_rotation_on_client_on_disk()
-    #test_rotation_on_server_on_memory()
-    test_rotation_on_disk(True)
-    #test_rotation_on_disk(False)
+    #test_cache()
+    #test_rotation_on_disk(True)
     #test_rotation_on_memory(True)
     #test_default(False)
     #test_default(False)
-    #test_rotation_on_disk(False)
+    test_as_dataset(True)

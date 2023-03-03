@@ -9,6 +9,8 @@ common.py: common tools
 * Date: 2022-06-14
 * Version: 0.0.1
 
+This is part of the dataset_server project
+
 License
 -------
 Apache License 2.0
@@ -17,8 +19,6 @@ Apache License 2.0
 """
 from __future__ import annotations
 import dill
-from loguru import logger
-from torch.utils.data import Dataset as TorchDataset
 import os
 import numpy as np
 from tqdm import tqdm
@@ -71,7 +71,7 @@ def shuffle_indices(start_idx, stop_idx, nearby_shuffle):
     return indices
 
 
-class BinaryBlob(TorchDataset):
+class BinaryBlob:
     """
     abstraction for binary blob storage
     taken from mlproject.data (https://github.com/viebboy/mlproject)
@@ -81,6 +81,7 @@ class BinaryBlob(TorchDataset):
         self._mode = 'write' if mode == 'w' else 'read'
         self._binary_file = binary_file
         self._index_file = index_file
+        self._cur_index = -1
 
         if mode == 'w':
             # writing mode
@@ -114,6 +115,16 @@ class BinaryBlob(TorchDataset):
             # sorted indices
             self._sorted_indices = list(self._indices)
             self._sorted_indices.sort()
+
+    def __iter__(self):
+        self._cur_index = -1
+        return self
+
+    def __next__(self):
+        self._cur_index += 1
+        if self._cur_index < len(self):
+            return self.__getitem__(self._cur_index)
+        raise StopIteration
 
     def mode(self):
         return self._mode
