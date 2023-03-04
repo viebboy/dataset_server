@@ -1017,7 +1017,6 @@ class DatasetLoader(TaskThread):
                     f'the dataset loader might fail to load dataset because dependent modules are not loaded',
                 )
                 logger.warning(''.join(msg))
-                logger.warning(f'sys.modules contain the following modules: {sys.modules.keys()}')
 
             spec.loader.exec_module(module)
             logger.debug(f'complete executing module')

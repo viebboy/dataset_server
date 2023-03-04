@@ -21,6 +21,8 @@ Clone this repo, install dependencies in `requirements.txt` and run `pip install
 
 ## Usage
 
+**Note**: to turn off debug messages, you can set via env var as `export LOGURU_LEVEL=INFO`. 
+
 Basically, to create an async data loader, we need a dataset class that is constructed with only keyword arguments. 
 
 That is, the dataset must be created like this `dataset = YourDataset(**kwargs)`. 
