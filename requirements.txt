@@ -2,3 +2,4 @@ numpy
 dill
 loguru
 task-virtualthread
+tqdm
