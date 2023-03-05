@@ -14,4 +14,5 @@ setuptools.setup(
     license='LICENSE.txt',
     packages=setuptools.find_packages(),
     classifiers=['Operating System :: POSIX', ],
+    python_requires='>=3.8',
 )
