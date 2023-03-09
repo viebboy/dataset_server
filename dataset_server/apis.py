@@ -52,10 +52,11 @@ def get_random_file(length):
 
 
 def get_random_name(length):
+    random.seed(int(time.time() * 1000))
     assert 0 < length < 256
     alphabet = list(string.ascii_lowercase)
     random_name = [random.choice(alphabet) for _ in range(length)]
-    return ''.join(random_name)
+    return ''.join(random_name) + str(time.time())
 
 
 def move_data_to_device(data, device):
