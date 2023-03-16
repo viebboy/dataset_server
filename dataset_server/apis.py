@@ -56,7 +56,7 @@ def get_random_name(length):
     assert 0 < length < 256
     alphabet = list(string.ascii_lowercase)
     random_name = [random.choice(alphabet) for _ in range(length)]
-    return ''.join(random_name) + str(time.time())
+    return ''.join(random_name) + str(1000 * time.time())
 
 
 def move_data_to_device(data, device):
@@ -504,6 +504,7 @@ class DataLoader:
             worker = Worker(name, **params)
             worker.start()
             self.workers.append(worker)
+            time.sleep(5)
 
         # now check if workers are ready
         indices = list(range(nb_worker))
