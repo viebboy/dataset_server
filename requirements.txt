@@ -3,3 +3,4 @@ dill
 loguru
 task-virtualthread
 tqdm
+GitPython

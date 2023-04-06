@@ -1,3 +1,68 @@
-from dataset_server.apis import DataLoader
+"""
+__init__.py: init file
+----------------------
 
+
+* Copyright: 2022 Dat Tran
+* Authors: Dat Tran (viebboy@gmail.com)
+* Date: 2023-04-06
+* Version: 0.0.1
+
+This is part of the dataset_server (github.com/viebboy/dataset_server)
+
+License
+-------
+Apache License 2.0
+
+
+"""
+
+# check for update
+try:
+    from loguru import logger
+    import git
+    import pkg_resources
+    import requests
+    import os
+    has_dep = True
+except Exception as error:
+    print('WARNING: (re)install the dependencies in requirements.txt')
+    has_dep = False
+
+if has_dep:
+    package = 'dataset_server'
+    branch = 'multiprocessing'
+
+    remote_repo = f"https://github.com/viebboy/{package}"
+
+    # Get the local path
+    try:
+        src_path = pkg_resources.resource_filename(package, "")
+        is_installed = True
+    except Exception:
+        is_installed = False
+
+    if is_installed:
+        local_path = os.path.dirname(src_path)
+        local_repo = git.Repo(local_path)
+
+        # Get the current commit hash of the local repository
+        local_commit = local_repo.head.object.hexsha
+
+        # Query the GitHub API for the latest commit on the main branch of the remote repository
+        api_url = f"https://api.github.com/repos/{remote_repo.split('/')[-2]}/{remote_repo.split('/')[-1]}"
+        response = requests.get(f"{api_url}/branches/{branch}")
+        response.raise_for_status()
+        remote_commit = response.json()["commit"]["sha"]
+
+        # Compare the local and remote commit hashes
+        if local_commit != remote_commit:
+            logger.warning(
+                'local commit diverges from remote commit. Please consider updating'
+            )
+            logger.warning('local commit on branch {branch}: {local_commit}')
+            logger.warning('remote commit on branch {branch}: {remote_commit}')
+
+
+from dataset_server.apis import DataLoader
 __all__ = ['DataLoader']

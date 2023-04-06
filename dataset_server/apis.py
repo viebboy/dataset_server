@@ -51,14 +51,6 @@ def get_random_file(length):
     return random_name
 
 
-def get_random_name(length):
-    random.seed(int(time.time() * 1000))
-    assert 0 < length < 256
-    alphabet = list(string.ascii_lowercase)
-    random_name = [random.choice(alphabet) for _ in range(length)]
-    return ''.join(random_name) + str(1000 * time.time())
-
-
 def move_data_to_device(data, device):
     if isinstance(data, (tuple, list)):
         return [move_data_to_device(item) for item in data]
@@ -129,12 +121,11 @@ class Worker(CTX.Process):
         self._back_read_pipe, self._front_write_pipe = CTX.Pipe()
 
         # create random name and shared memory from this name
-        kwargs['memory_name'] = get_random_name(16)
         self.shared_memory = SM.SharedMemory(
-            name=kwargs['memory_name'],
             create=True,
             size=kwargs['max_minibatch_length']
         )
+        kwargs['memory_name'] = self.shared_memory.name
 
         self.kwargs = kwargs
         self.is_closed = False
