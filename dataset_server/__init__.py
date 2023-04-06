@@ -58,7 +58,7 @@ if has_dep:
         # Compare the local and remote commit hashes
         if local_commit != remote_commit:
             logger.warning(
-                'local commit diverges from remote commit. Please consider updating'
+                f'local commit diverges from remote commit in package {package}. Please consider updating'
             )
             logger.warning('local commit on branch {branch}: {local_commit}')
             logger.warning('remote commit on branch {branch}: {remote_commit}')
