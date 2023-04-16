@@ -18,6 +18,7 @@ Apache License 2.0
 """
 
 # check for update
+import time
 try:
     from loguru import logger
     import git
@@ -26,10 +27,28 @@ try:
     import os
     has_dep = True
 except Exception as error:
-    print('WARNING: (re)install the dependencies in requirements.txt')
+    print('package dataset_server WARNING: (re)install the dependencies in requirements.txt')
     has_dep = False
 
-if has_dep:
+# root dir is for user configuration
+STATUS_FILE = os.path.join(os.path.expanduser('~'), '.dataset_server.status')
+has_status_file = os.path.exists(STATUS_FILE)
+
+if has_status_file:
+    last_modified = os.path.getmtime(STATUS_FILE)
+    days_since_modified = (time.time() - last_modified) / (24 * 3600)
+    if days_since_last_modified > 1:
+        require_checking = True
+    else:
+        require_checking = False
+else:
+    require_checking = True
+
+
+if has_dep and require_checking:
+    with open(STATUS_FILE, 'w') as fid:
+        fid.write('')
+
     package = 'dataset_server'
     branch = 'multiprocessing'
 
