@@ -36,7 +36,7 @@ has_status_file = os.path.exists(STATUS_FILE)
 
 if has_status_file:
     last_modified = os.path.getmtime(STATUS_FILE)
-    days_since_modified = (time.time() - last_modified) / (24 * 3600)
+    days_since_last_modified = (time.time() - last_modified) / (24 * 3600)
     if days_since_last_modified > 1:
         require_checking = True
     else:
