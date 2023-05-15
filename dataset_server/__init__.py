@@ -19,12 +19,13 @@ Apache License 2.0
 
 # check for update
 import time
+import os
+
 try:
     from loguru import logger
     import git
     import pkg_resources
     import requests
-    import os
     has_dep = True
 except Exception as error:
     print('package dataset_server WARNING: (re)install the dependencies in requirements.txt')
